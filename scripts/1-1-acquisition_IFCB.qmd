@@ -1,0 +1,250 @@
+---
+title: "IFCB data querry and processing" # title of the notebook
+author: "Virginie Sonnet" 
+date: 2023-10-01
+description: 
+    This script querries IFCB data and processes it into hourly data, adding the taxonomy. 
+html: 
+theme: sandstone
+#mainfont: "LM Roman"
+fontsize: 0.99em
+toc: true # table of contents
+toc-depth: 5 
+toc-location: left # table of contents on the left 
+lightbox: TRUE # allows to click on an image to zoom in the HTML document
+embed-resources: true # avoid having dependencies in an extra folder
+smooth-scroll: true
+editor: visual
+code-overflow: wrap
+code-fold: false
+execute:
+    eval: true # run the code chunks FALSE/TRUE
+    echo: true # print the source code FALSE/TRUE
+    error: true # print error messages FALSE/TRUE
+    message: false # print any message FALSE/TRUE
+    warning: false # print warning message FALSE/TRUE
+    cache: false 
+---
+
+```{r}
+#| eval: false
+#| echo: false
+
+Other outputs: pdf_document, html_notebook, word_document 
+The HTML below just says to use the "LM Roman" family as font (kind of Arial?) and if you want the Latex font, you just need "Latin Modern Roman". The line below indicates that the text has to be justified. 
+```
+
+```{r}
+#| include: false
+
+# make sure that no object is in the environment and collect the garbage 
+rm(list=ls())
+gc()
+```
+
+# Introduction
+
+------------------------------------------------------------------------
+
+This script queries the IFCB: basically, it queries all organisms within an hour and sums their biomasse. For the biomass, it uses the summedBiovolume so that when there are several organisms on the picture (or a chain like *Thalassiosira* whose threads aren't detected by the processing algorithm), they are all taken into account.
+
+```{r}
+# general 
+library(tidyverse) 
+library(lubridate)
+
+# databases
+library(RMySQL) 
+```
+
+# Data
+
+------------------------------------------------------------------------
+
+## Database connection
+
+We need to set up the database connection:
+
+```{r}
+Sys.setenv(MYSQL_PWD_VIRGINIE="Restmonami") #pwd
+db_ifcb <- dbConnect(MySQL(),
+                dbname="ifcb", 
+                host="data.base.uri.edu", 
+                port=3306, 
+                user="virginie", 
+                password=Sys.getenv("MYSQL_PWD_VIRGINIE")) # connect
+```
+
+## Query
+
+I'm querying only the data for GSO Dock location (location = 1), with a good qc (qc_file = 1), for the time period 2017-11-01 to 1 2019-10-31.
+
+One sample has no mL_counted, meaning we don't know how much the IFCB was actually sampling and I cannot use this sample quantitatively, it is removed.
+
+```{r}
+# query the class id counts 
+data <- dbGetQuery(conn = db_ifcb,
+                  statement = "SELECT date, mL_counted,
+                  class_id, SUM(summedBiovolume) AS vol
+                  FROM auto_class 
+                  JOIN roi ON auto_class.roi_id=roi.id
+                  JOIN raw_files ON auto_class.raw_file_id=raw_files.id
+                  WHERE location_id=1 AND qc_file = 1 AND 
+                  mL_counted != 0 AND
+                  date > '2017-11-01' AND date < '2019-10-31'
+                  GROUP BY date, mL_counted, class_id
+                  ORDER BY date;")
+```
+
+# Processing
+
+------------------------------------------------------------------------
+
+## Hourly biovolume
+
+Now I can process the data per hour. Note that the `round_date` function will round the date to the **nearest** hour.
+
+```{r}
+# keep the mL_counted separate so that they are not summed for each image
+ml_hour <- distinct(data, date, mL_counted) %>% 
+    mutate(date=round_date(ymd_hms(date),"hour")) %>% 
+    group_by(date) %>% 
+    summarize(mL_counted=sum(mL_counted))
+
+# sum the biovolume of all images within an hour                        
+data <- data %>% 
+    select(-mL_counted) %>% 
+    mutate(date=round_date(ymd_hms(date),"hour")) %>% 
+    group_by(date,class_id) %>% 
+    summarize(vol=sum(vol))
+```
+
+The second part is to adjust the biovolume to the amount of mL sampled per hour and convert it from cubed pixels to microns using the ratio 1um = 3.5 pixels.
+
+```{r}
+data <- data %>% 
+    # add the mL_counted within the hour 
+    left_join(ml_hour) %>% 
+    # calculate the ajusted biovolume 
+    mutate(vol=vol/mL_counted) %>% 
+    # convert into um3
+    mutate(vol=vol/(3.5*3.5*3.5)) %>% 
+    # remove the mL_counted column
+    select(-mL_counted)
+
+# have a look 
+data
+```
+
+## Common classes
+
+First, some categories are referring to the same class and have only been separated for ease of morphological classification (and sometimes given another name because taxonomy softwares don't have an extended set of names...) or cannot be distinguished and one is more dominant than the other. I am summing them together and I will rename them once I add the phylogeny:
+
+-   skeletonema small (54) = Skeletonema costatum (318)
+
+-   thalassiosira single (425) = thalassiosira chain (418)
+
+-   Leptocylindrus convexus (272) = group cerataulina_pelagica (420)
+
+-   Minidiscus (81) = detritus dark (70)
+
+-   margalefidinium polykrikoides single (280) = Margalefidinium polykrikoides (279)
+
+-   Guinardia flaccida (123) = Guinardia delicatula (29)
+
+-   Guinardia striata (30) = group eucampia (422)
+
+```{r}
+data <- data %>% 
+  mutate(class_id=case_when(class_id==280~279,
+                          class_id==54~318,
+                          class_id==425~418,
+                          class_id==272~420,
+                          class_id==81~70,
+                          class_id==123~29,
+                          class_id==30~422,
+                          TRUE ~ class_id)) %>% 
+  group_by(date,class_id) %>% 
+  summarize(vol = sum(vol,na.rm=TRUE))
+```
+
+## Dates
+
+For easier comparison with the other 2 datasets and for plotting, it will be important to have all the dates, not only the ones during which the IFCB sampled.
+
+```{r}
+# regularized dates 
+dates <- crossing(date=seq(min(data$date),max(data$date),"hour"),
+                  class_id=unique(data$class_id))
+
+# add the regularized dates
+data <- left_join(dates, data) %>% 
+    group_by(date) %>% 
+    # consider that if there is no data that means it's 0 buuut if the whole hour has no data then it wasn't sampled
+    mutate(vol=ifelse(is.na(vol) & sum(vol,na.rm=TRUE) != 0,0,vol)) 
+```
+
+Note that the dates are in UTC. They can be converted to EST/EDT but, by default, R changes the dates back to UTC when exporting so they would have to be saved as strings.
+
+## Taxonomy
+
+I am adding the general group classification (Diatoms, Dinoflagellates, Zooplankton, Non-plankton...) and a second level of more precise grouping related to the taxonomy. Those groups were determined based on the accepted scientific name and phylogeny retrieved with the Taxonomy Match script (https://github.com/VirginieSonnet/TaxonomyMatch).
+
+```{r}
+# phylogeny
+phyl <- read_csv("../data/processed_gsoIFCB_classes_phylogeny+precise_group.csv") %>% 
+    select(class_id=id, class=gso_name, group_type, group_type_precise)
+
+
+# add the phylogeny
+data <- left_join(data,phyl) %>% 
+    # clean the names automatically
+    mutate(genus = str_split_i(class," ", 1),
+           species = str_split_i(class," ", 2)) %>% 
+    mutate(sp=case_when(genus=="group"~ str_split_i(class, " ", 2),
+                        is.na(species) ~ paste0(genus," sp."),
+                        TRUE ~ paste(str_sub(genus,1,1),species,sep=". "))) %>% 
+    # clean up a couple 
+    mutate(sp=case_when(sp=="e. long"~"euglenophyceae",
+                        sp=="Euplotes sp."~"euplotes",
+                        sp=="cerataulina_pelagica"~"C. pelagica",
+                        sp=="chaetoceros_chain"~"Chaetoceros spp. chain",
+                        sp=="chaetoceros_single"~"Chaetoceros spp. single",
+                        sp=="cylindrotheca"~"Cylindrotheca sp.",
+                        sp=="ditylum"~"Ditylum sp.",
+                        sp=="eucampia"~"Eucampia sp.",
+                        sp=="gyrodinium"~"Gyrodinium sp.",
+                        sp=="pleuro_gyrosigma"~"Pleurosigma sp.",
+                        sp=="protoperidinium"~"Protoperidinium sp.",
+                        sp=="protozoa_morphology"~"protozoa",
+                        sp=="pseudo-nitzschia"~"Pseudo-nitzschia spp.",
+                        sp=="rhizosolenia"~"Rhizosolenia spp.",
+                        sp=="pyramimonas"~"Pyramimonas sp.",
+                        sp=="thalassiosira_chain"~"Thalassiosira spp.",
+                        sp=="G. delicatula"~"Guinardia sp.",
+                        sp=="l. single"~"Licmophora sp.",
+                        sp=="S. costatum"~"Skeletonema spp.",
+                        TRUE ~ sp
+                        )) %>% 
+    # remove the genus and species columns
+    select(-c(genus,species)) %>% 
+    # rename protozoa as nanophytoplankton
+    mutate(group_type=ifelse(sp=="protozoa","nanophytoplankton",group_type),
+           group_type_precise=ifelse(sp=="protozoa","nanophytoplankton",group_type_precise),
+           class=ifelse(sp=="protozoa","nanophytoplankton",class),
+           sp=ifelse(sp=="protozoa","nanophytoplankton",sp))
+```
+
+To finish, I want to remove everything that is Non-Plankton (detritus, bubble...) or unclassified.
+
+```{r}
+data <- filter(data, group_type != "Non-plankton" & class != "unclassified")
+```
+
+# Export
+
+------------------------------------------------------------------------
+
+```{r}
+write_csv(data,"../data/processed_gsoIFCB_classes_hourly_vol.csv")
+```

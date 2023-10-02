@@ -1,0 +1,394 @@
+---
+title: "Resampling the IFCB data" # title of the notebook
+author: "Virginie Sonnet" 
+date: 2023-03-14
+description: 
+    This script re-samples IFCB data on a daily, weekly and satellite-temporal resolution. 
+html: 
+theme: sandstone
+#mainfont: "LM Roman"
+fontsize: 0.99em
+toc: true # table of contents
+toc-depth: 5 
+toc-location: left # table of contents on the left 
+lightbox: TRUE # allows to click on an image to zoom in the HTML document
+embed-resources: true # avoid having dependencies in an extra folder
+smooth-scroll: true
+editor: visual
+code-overflow: wrap
+code-fold: false
+number-sections: true
+execute:
+    eval: true # run the code chunks FALSE/TRUE
+    echo: true # print the source code FALSE/TRUE
+    error: true # print error messages FALSE/TRUE
+    message: false # print any message FALSE/TRUE
+    warning: false # print warning message FALSE/TRUE
+    cache: false 
+---
+
+```{r}
+#| eval: false
+#| echo: false
+
+Other outputs: pdf_document, html_notebook, word_document 
+The HTML below just says to use the "LM Roman" family as font (kind of Arial?) and if you want the Latex font, you just need "Latin Modern Roman". The line below indicates that the text has to be justified. 
+```
+
+```{r}
+#| include: false
+
+# make sure that no object is in the environment and collect the garbage 
+rm(list=ls())
+gc()
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(castr)
+library(imputeTS)
+
+
+# graphics 
+library(cowplot)
+library(glue)
+library(ggtext)
+```
+
+# Introduction
+
+------------------------------------------------------------------------
+
+To re-sample the IFCB I need the days during which there was microscopy or satellite sampling.
+
+## IFCB
+
+For the IFCB data, if the gap is less than 3h then I interpolate linearly (approximately the time needed for maintenance).
+
+I also define the Year 1 (November 2017 to October 2018) and Year 2 (November 2018 to October 2019).
+
+```{r}
+# IFCB data 
+data <- read_csv("../data/processed_gsoIFCB_classes_hourly_vol.csv") %>% 
+    # correct the time zone from UTC to EST/EDT
+    mutate(date=with_tz(date,tzone="America/New_York")) %>% 
+    mutate(day=floor_date(date,"day")) %>% 
+    # add the year label
+    mutate(year=year(date)) %>% 
+    mutate(year=ifelse(month(date) %in% c(11,12),year+1,year)) %>% 
+    mutate(year=ifelse(year==2018,"Year 1","Year 2"))
+
+
+# interpolation
+data <- data %>% 
+    # make sure the time series is ordered
+    arrange(date,class) %>% 
+    group_by(class) %>% 
+    # interpolation 
+    mutate(vol=na_interpolation(vol,maxgap = 3))
+```
+
+## Satellite
+
+For the satellite data, I exclude the pixels on the land and calculate the average chlorophyll over the 3x4 pixels subset. I only keep the samples for which the value is not NA, meaning at least 1 pixel had a chlorophyll value (and within our time range).
+
+```{r}
+# get the chlorophyll pixels
+satchl <- read_csv("../data/raw_gsoOptics_OLCI_chla_3x4_subset.csv") %>% 
+    # only keep the sea and non-GSO ones
+    filter(land==FALSE & type != "GSO") %>% 
+    # take the average per sample 
+    group_by(swath_id) %>% 
+    summarize(avg=mean(chl,na.rm=TRUE)) 
+    
+# associate the chlorophyll data with the metadata 
+meta <- read_csv("../data/raw_gsoOptics_OLCI_metadata.csv") %>% 
+    select(UTC,satellite,swath_id,sampling_id) %>% 
+    mutate(date=with_tz(UTC,"America/New_York")) %>% 
+    left_join(satchl) %>% 
+    arrange(date)
+
+# only keep the samples for which we have chlorophyll data 
+meta <- meta %>% 
+    filter(!(is.na(avg))) %>% 
+    mutate(date=round_date(date,"hour")) %>% 
+    select(date,avg) %>% 
+    # only keep the 2 years of data
+    filter(date < "2019-11-01") %>% 
+    # add day
+    mutate(day=floor_date(date,"day"))
+```
+
+## NBPTS
+
+For the Narragansett Plankton Survey, I keep only the surface samples.
+
+```{r}
+# NBPTS days 
+nbpts <- read_csv("../data/raw_nbptsMicroscopy_plankton-counts.csv") %>% 
+    # remove the first row that's units 
+    slice(-1) %>% 
+    # restrict to our study time
+    mutate(day=dmy(DATE)) %>%
+    mutate(day=force_tz(day,tzone="America/New_York")) %>% 
+    filter(day >= "2017-11-01" & day < "2019-11-01") %>% 
+    # only keep surface samples
+    filter(`COUNT TYPE`=="S/R Surface") %>% 
+    select(day)
+```
+
+# Resampling
+
+------------------------------------------------------------------------
+
+The difference between the total biomass and the classes biomass is that I smooth the total biomass with a 9h window (4 hours before and 4 hours after) to remove very high inter-hours variabilities. I am not doing it for the classes due to the high 0 counts that it would erase. The Ciliates and Zooplankton are also removed from the total biomass since they are not phytoplankton.
+
+## Total biomass
+
+### Hourly
+
+No resampling needed but removal of non-phytoplankton and smoothing with a moving average.
+
+```{r}
+# hourly data 
+tot_data <- data %>% 
+    # only keep the phytoplankton 
+    filter(!(group_type %in% c("Ciliates","Zooplankton"))) %>% 
+    # get the biomasse per hour 
+    group_by(year,day,date) %>% 
+    summarize(vol=sum(vol)) %>% 
+    # smoothing (make sure the data is in the correct chronological order)
+    arrange(year,day,date) %>% 
+    mutate(vol=smooth(vol,k=4))
+
+redata <- tot_data %>% 
+    mutate(type="Hourly")
+```
+
+### Daily
+
+If taking only the 9am value, a lot of data will be 0 because the IFCB samples a small amount of water so bigger organisms may not appear in each sample when no bloom is happening. I am taking the mean over the day.
+
+```{r}
+# daily data 
+redata <- tot_data %>% 
+    group_by(day) %>% 
+    mutate(vol=ifelse(hour(date)==9,mean(vol,na.rm=TRUE),NA),
+           type="Daily") %>% 
+    bind_rows(redata)
+```
+
+### Satellite
+
+```{r}
+# satellite data 
+redata <- tot_data %>% 
+    group_by(day) %>% 
+    mutate(vol=ifelse(day %in% meta$day & hour(date)==9,mean(vol,na.rm=TRUE),NA),
+           type="Satellite") %>% 
+    bind_rows(redata)
+```
+
+### NBPTS
+
+```{r}
+# weekly microscopy
+redata <- tot_data %>% 
+    group_by(day) %>% 
+    mutate(vol=ifelse(day %in% nbpts$day & hour(date)==9, mean(vol,na.rm=TRUE),NA),
+           type="NBPTS") %>% 
+    bind_rows(redata)
+```
+
+### Export
+
+```{r}
+write_csv(redata,"../data/processed_gsoIFCB_resampled_biomass.csv")
+```
+
+## Classes
+
+### Hourly
+
+No resampling needed.
+
+```{r}
+# hourly data 
+redata <- data %>% 
+    mutate(type="Hourly")
+```
+
+### Daily
+
+If taking only the 9am value, a lot of data will be 0 because the IFCB samples a small amount of water so bigger organisms may not appear in each sample when no bloom is happening. I am taking the mean over the day.
+
+```{r}
+# daily data 
+redata <- data %>% 
+    group_by(class,day) %>% 
+    mutate(vol=ifelse(hour(date)==9,mean(vol,na.rm=TRUE),NA),
+           type="Daily") %>% 
+    bind_rows(redata)
+```
+
+### Satellite
+
+```{r}
+# satellite data 
+redata <- data %>% 
+    group_by(class,day) %>% 
+    mutate(vol=ifelse(day %in% meta$day & hour(date)==9,mean(vol,na.rm=TRUE),NA),
+           type="Satellite") %>% 
+    bind_rows(redata)
+```
+
+### NBPTS
+
+```{r}
+# weekly microscopy
+redata <- data %>% 
+    group_by(class,day) %>% 
+    mutate(vol=ifelse(day %in% nbpts$day & hour(date)==9, mean(vol,na.rm=TRUE),NA),
+           type="NBPTS") %>% 
+    bind_rows(redata)
+```
+
+### Export
+
+```{r}
+write_csv(redata,"../data/processed_gsoIFCB_resampled_classes.csv")
+```
+
+# Plot
+
+------------------------------------------------------------------------
+
+The plot looks at the amount of days sampled over the time series. The hourly distribution is not represented because it is similar to the daily one.
+
+## Preparation
+
+I need a matrix of 0s (absence of data) and 1s (presence of data).
+
+```{r}
+plot <- redata %>% 
+    ungroup() %>% 
+    filter(type != "Hourly") %>% 
+    select(type,day,vol) %>% 
+    group_by(type,day) %>% 
+    summarize(vol=sum(vol,na.rm=TRUE)) %>% 
+    mutate(vol=ifelse(vol==0,0,1))
+```
+
+For comparison, I want to add the raw satellite data and NBPTS data:
+
+```{r}
+# change the names to differentiate for the plotting 
+plot <- plot %>% 
+    mutate(type=case_when(type=="Daily"~"IFCB daily/hourly",
+                          type=="Satellite"~"IFCB satellite",
+                          type=="NBPTS"~"IFCB NBPTS",
+                          TRUE ~ type))
+
+# satellite data 
+plot <- data %>% 
+    ungroup() %>% 
+    distinct(day) %>% 
+    mutate(vol=ifelse(day %in% meta$day,1,0),
+           type="Satellite") %>% 
+    bind_rows(plot)
+
+# weekly microscopy data
+plot <- data %>% 
+    ungroup() %>% 
+    distinct(day) %>% 
+    mutate(vol=ifelse(day %in% nbpts$day,1,0),
+           type="NBPTS") %>% 
+    bind_rows(plot)
+```
+
+## Plotting
+
+```{r}
+# time series
+ts <- plot %>% 
+    # only keep the presence data 
+    filter(vol==1) %>% 
+    # reorder factors and make the labels a different color
+    mutate(color=ifelse(type %in% c("NBPTS","Satellite"),"grey","black")) %>% 
+    mutate(type=glue("<i style='color:{color}'>{type}</i>")) %>% 
+    mutate(type=factor(type,levels=c("<i style='color:grey'>NBPTS</i>",
+                                     "<i style='color:grey'>Satellite</i>",
+                                     "<i style='color:black'>IFCB NBPTS</i>",
+                                     "<i style='color:black'>IFCB satellite</i>",
+                                     "<i style='color:black'>IFCB daily/hourly</i>"
+                                     ))) %>% 
+    ggplot(aes(x=day,y=type,color=type, fill=type)) + 
+    geom_point(pch = "|", cex = 8) + 
+    scale_color_manual(values=c("grey","grey","black","black","black")) + 
+    theme_classic() + 
+    scale_x_datetime(date_breaks="6 months",date_labels="%b \n%Y") + 
+    theme(text=element_text(size=15),
+          legend.position="none",
+          axis.text.y=element_markdown(face="bold")) + 
+    labs(y="",x="")
+ts 
+
+
+# percentages (they all have 721 days in the time series)
+plot %>% 
+    filter(vol != 0) %>% 
+    count(type,vol) %>% 
+    mutate(p=n*100/721,
+           type=factor(type,levels=c("NBPTS","Satellite","IFCB NBPTS",
+                                     "IFCB satellite","IFCB daily/hourly"))) %>%
+    ggplot(aes(x=type,y=p,fill=type)) + 
+    geom_col() + 
+    theme_classic() + 
+    geom_text(aes(label=paste(round(p),"%",sep="")),hjust=-0.25,size = 3.5, 
+                      fontface = "bold",color="black") + 
+    scale_fill_manual(values=c("grey","grey","black","black","black")) + 
+    coord_flip() + 
+    theme(text=element_text(size=15),
+          #axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          legend.position="none") + 
+    labs(y="% days with data",x="") +
+    scale_y_continuous(limits=c(0,80))
+
+p <- plot %>% 
+    filter(vol != 0) %>% 
+    count(type,vol) %>% 
+    mutate(p=n*100/721,
+           type=factor(type,levels=c("NBPTS","Satellite","IFCB NBPTS",
+                                     "IFCB satellite","IFCB daily/hourly"))) %>%
+    ggplot(aes(x=type,y=p,fill=type)) + 
+    geom_col() + 
+    theme_classic() + 
+    geom_text(aes(label=paste(round(p),"%",sep="")),hjust=-0.25,size = 3.5, 
+                      fontface = "bold",color="black") + 
+    scale_fill_manual(values=c("grey","grey","black","black","black")) + 
+    coord_flip() + 
+    theme(text=element_text(size=15),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title.x=element_text(size=12,face="bold"),
+          legend.position="none") + 
+    labs(y="% days with data",x="") +
+    scale_y_continuous(limits=c(0,90))
+    
+# combine 
+plot_grid(ts,p,align="h",byrow=FALSE, rel_widths = c(4.5,1),labels="auto")
+```
+
+Save the figure:
+
+```{r}
+ggsave(path = "../figures/", filename="Fig2.tiff", width = 5, height = 3, device='tiff', dpi=300, units="in",scale=0.8)
+```
+
+We can export the resolutions because they can be useful in discussing the results.
+
+```{r}
+write_csv(filter(plot,vol==1),"../data/processed_gsoIFCB_resolutions.csv")
+```

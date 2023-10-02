@@ -1,0 +1,623 @@
+---
+title: "Detect phytoplankton blooms" # title of the notebook
+author: "Virginie Sonnet" 
+date: 2023-10-01
+description: 
+    This script detects phytoplankton blooms at different resolutions. 
+html: 
+theme: sandstone
+#mainfont: "LM Roman"
+fontsize: 0.99em
+toc: true # table of contents
+toc-depth: 5 
+toc-location: left # table of contents on the left 
+lightbox: TRUE # allows to click on an image to zoom in the HTML document
+embed-resources: true # avoid having dependencies in an extra folder
+smooth-scroll: true
+editor: visual
+code-overflow: wrap
+code-fold: false
+number-sections: true
+execute:
+    eval: true # run the code chunks FALSE/TRUE
+    echo: true # print the source code FALSE/TRUE
+    error: true # print error messages FALSE/TRUE
+    message: false # print any message FALSE/TRUE
+    warning: false # print warning message FALSE/TRUE
+    cache: false 
+---
+
+```{r}
+#| eval: false
+#| echo: false
+
+Other outputs: pdf_document, html_notebook, word_document 
+The HTML below just says to use the "LM Roman" family as font (kind of Arial?) and if you want the Latex font, you just need "Latin Modern Roman". The line below indicates that the text has to be justified. 
+```
+
+```{r}
+#| include: false
+
+# make sure that no object is in the environment and collect the garbage 
+rm(list=ls())
+gc()
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(castr)
+library(imputeTS)
+
+library(cowplot)
+library(scales)
+```
+
+# Introduction
+
+------------------------------------------------------------------------
+
+This script uses phytoplankton biomass from the IFCB to detect the major yearly bloom for each of the two years and the peaks in biomasse throughout the time series.
+
+```{r}
+data <- read_csv("../data/processed_gsoIFCB_resampled_biomass.csv") %>%
+    # convert to EST_EDT
+    mutate(date=with_tz(date,"America/New_York"))
+```
+
+# General plot
+
+------------------------------------------------------------------------
+
+To construct the general plot I want:
+
+-   add smoothed values to help visualization
+
+-   add the median +5%
+
+```{r}
+# median 
+med <- median(data$vol,na.rm=TRUE) + 5*median(data$vol,na.rm=TRUE)/100
+
+data %>% 
+    filter(type=="Hourly") %>%
+    mutate(svol=smooth(vol,k=24,n=30)) %>%
+    select(date,vol,svol) %>%
+    ggplot() + 
+    geom_point(aes(x=date,y=vol),size=0.8,color="grey70") + 
+    geom_line(aes(x=date,y=svol),size=0.8) + 
+    geom_hline(yintercept=med,linetype="dashed",color="orangered4",size=1) +
+    scale_color_manual(values=c("grey70","black")) + 
+    theme_classic() + 
+    scale_x_datetime(date_labels="%b \n%Y",date_breaks="4 months") + 
+    scale_y_continuous(labels = label_comma()) + 
+    labs(x="",y="Biovolume (um3/ml") + 
+    theme(text=element_text(size=12),
+          axis.title.y = element_text(face="bold"))
+```
+
+# Main yearly bloom
+
+------------------------------------------------------------------------
+
+## Start and end dates
+
+```{r}
+# choose a random year to assign for plotting 
+data <- mutate(data,plot_date = `year<-`(date, 2020))
+```
+
+I will use the median plus 5% of the median as the threshold for bloom start date for all resolutions.
+
+```{r}
+# get the median for each sampling resolution
+ymed <- data %>% 
+    group_by(type) %>% 
+    summarize(medvol=median(vol,na.rm=TRUE)) %>% 
+    mutate(t=medvol+5*medvol/100)
+```
+
+To select the main yearly bloom, I'm going to take the maximum biomass data for each year.
+
+```{r}
+# main bloom
+main_bloom <- data %>% 
+    left_join(ymed) %>% 
+    # get the max per year and resolution
+    group_by(year,type) %>% 
+    filter(vol==max(vol,na.rm=TRUE))
+```
+
+As it happen, there are two maximum for 2019 for the hourly data because of the smoothing (the value is repeated for 2 hours so I'll just take the first one, it makes the max at midnight or 2am).
+
+```{r}
+main_bloom <- main_bloom %>% 
+    group_by(year,type) %>% 
+    filter(date==min(date))
+```
+
+I define the start as the time before this maximum that crosses the 5% yearly median. However 2 things need to be taken into consideration:
+
+-   due to the high inter-hour variability from the instrument, some values may be well above the threshold and then right after go down below it, so I will allow for up to 12h of data below the threshold (12 points)
+
+-   there are missing data when the instrument had to be repaired or maintenance, although we can't be sure, I'll assume that if we are above the threshold before and after a 72h period we were most likely above also during the 72h so allow for up to 72h of missing data (72 points)
+
+For the daily values, it is similar, just allow up to 72h of missing data (2 points), no below threshold values.
+
+For the satellite and NBPTS, allow for up to 9 days of missing data (1 point).
+
+The way to ignore those 12 hours of below threshold and 48h of missing values is to fill them in using the last observation carried forward.
+
+```{r}
+# detect when it goes over the 5% threshold for a week = start date 
+start <- data %>% 
+    left_join(ymed)
+    
+
+starttime <- tibble()
+
+
+# loop over the 2 years and the 4 type resolutions 
+for (i in unique(start$year)){
+    for (j in unique(start$type)){
+    
+    # select the maximum for this year and resolution 
+    max <- filter(main_bloom,year==i & type==j)
+    
+    ##### Hourly ##### 
+    if (j =="Hourly"){
+        
+        
+    # detect the start date of the bloom
+    stemp <- filter(start,year==i & type==j & date <= max$date[1]) %>% arrange(desc(date)) %>%
+        # change all NA values for 999999999999 time to take care of the below threshold ones
+        mutate(navol=ifelse(is.na(vol),999999999999,vol)) %>% 
+        # convert below threshold values to NA and fill in at most 12 values
+        mutate(navol=ifelse(navol <= t,NA,navol)) %>% 
+        mutate(navol=na_locf(navol,maxgap=12)) %>% 
+        # put the ones that weren't converted back to below threshold vol values
+        mutate(navol=ifelse(is.na(navol),vol,navol)) %>% 
+        # put the 999999999999 values back to NA
+        mutate(navol=ifelse(navol==999999999999,NA,navol)) %>%
+        # fill in NAs for 48h
+        mutate(navol=na_locf(navol,maxgap=73)) %>% 
+        # add index 1 if above threshold
+        mutate(idx=ifelse(is.na(navol) | navol < t,0,1)) %>% 
+        # select the start date: sum all the idx and when it doesn't change = start date
+        mutate(s=cumsum(idx)) %>% 
+        mutate(diff=lead(s)-s) %>% 
+        filter(diff==0) %>% 
+        # add the fact that it's the start
+        mutate(time="start")
+    starttime=bind_rows(starttime,stemp[1,])
+    
+    
+    # detect the end date of the bloom
+    etemp <- filter(start,year==i & type==j & date >= max$date[1]) %>% 
+        # change all NA value for 999999999999 time to take care of the below threshold ones
+        mutate(navol=ifelse(is.na(vol),999999999999,vol)) %>% 
+        # convert below threshold values to NA and fill in at most 12 values
+        mutate(navol=ifelse(navol <= t,NA,navol)) %>% 
+        mutate(navol=na_locf(navol,maxgap=12)) %>% 
+        # put the ones that weren't converted back to below threshold values
+        mutate(navol=ifelse(is.na(navol),vol,navol)) %>% 
+        # put the 999999999999 values back to NA
+        mutate(navol=ifelse(navol==999999999999,NA,navol)) %>%
+        # fill in NAs for 48h
+        mutate(navol=na_locf(navol,maxgap=73)) %>% 
+        # add index if above threshold = 1
+        mutate(idx=ifelse(is.na(navol) | navol < t,0,1)) %>% 
+        mutate(s=cumsum(idx)) %>% 
+        mutate(diff=lead(s)-s) %>% 
+        filter(diff==0) %>% 
+        # add the fact that it's the end
+        mutate(time="end")
+    starttime=bind_rows(starttime,etemp[1,])
+    
+    
+    #### Daily #### 
+    } else if (j =="Daily"){
+        
+    # detect the start date of the bloom
+    stemp <- filter(start,year==i & type==j & date <= max$date[1]) %>% arrange(desc(date)) %>%
+        # fill in NAs for 48h
+        mutate(navol=na_locf(vol,maxgap=73)) %>% 
+        # add index if above threshold = 1
+        mutate(idx=ifelse(is.na(navol) | navol < t,0,1)) %>% 
+        mutate(s=cumsum(idx)) %>% 
+        mutate(diff=lead(s)-s) %>% 
+        filter(diff==0) %>% 
+        # add the fact that it's the start
+        mutate(time="start")
+    starttime=bind_rows(starttime,stemp[1,])
+    
+    # detect the end date of the bloom
+    etemp <- filter(start,year==i & type==j & date >= max$date[1]) %>% 
+        # fill in NAs for 48h
+        mutate(navol=na_locf(vol,maxgap=49)) %>% 
+        # add index if above threshold = 1
+        mutate(idx=ifelse(is.na(navol) | navol < t,0,1)) %>% 
+        mutate(s=cumsum(idx)) %>% 
+        mutate(diff=lead(s)-s) %>% 
+        filter(diff==0) %>% 
+        # add the fact that it's the end
+        mutate(time="end")
+    starttime=bind_rows(starttime,etemp[1,])
+    
+    
+    #### Satellite and NBPTS #####
+    } else if (j %in% c("Satellite","NBPTS")){
+        
+        
+    # detect the start date of the bloom
+    stemp <- filter(start,year==i & type==j & date <= max$date[1]) %>% arrange(desc(date)) %>%
+        # fill in NAs for 9 days
+        mutate(navol=na_locf(vol,maxgap=(24*9+1))) %>% 
+        # add index if above threshold = 1
+        mutate(idx=ifelse(is.na(navol) | navol < t,0,1)) %>% 
+        mutate(s=cumsum(idx)) %>% 
+        mutate(diff=lead(s)-s) %>% 
+        filter(diff==0) %>% 
+        # add the fact that it's the start
+        mutate(time="start")
+    starttime=bind_rows(starttime,stemp[1,])
+    
+    # detect the end date of the bloom
+    etemp <- filter(start,year==i & type==j & date >= max$date[1]) %>% 
+        # fill in NAs for 9 days
+        mutate(navol=na_locf(vol,maxgap=(24*9+1))) %>% 
+        # add index if above threshold = 1
+        mutate(idx=ifelse(is.na(navol) | navol < t,0,1)) %>% 
+        mutate(s=cumsum(idx)) %>% 
+        mutate(diff=lead(s)-s) %>% 
+        filter(diff==0) %>% 
+        # add the fact that it's the end
+        mutate(time="end")
+    starttime=bind_rows(starttime,etemp[1,])
+    }
+    }
+}
+```
+
+## Plot
+
+Now that I have the start and end dates, I can plot them. For that, I need to select the time frame for both the 2018 and 2019 blooms for all resolutions.
+
+```{r}
+# get the maximum and minimum start date for each year 
+dates <- starttime %>% 
+    group_by(year) %>% 
+    filter(date==max(date) | date==min(date)) %>% 
+    distinct(date)
+
+# create a vector with all hours between those dates 
+dates <- tibble(date=c(seq(dates$date[1],dates$date[2],by="hour"), # 2018
+                          seq(dates$date[3],dates$date[4],by="hour"))) # 2019
+```
+
+To help visualization, I also
+
+-   calculate smoothed values for the time series with a 3 hours windows and 30 repetitions
+
+-   add a different shape for the max value of each bloom for each resolution
+
+```{r}
+# smooth the data and select only the dates within the blooms time frames
+sdata <- data %>% 
+    filter(type=="Hourly") %>%
+    mutate(svol=smooth(vol,k=3,n=30)) %>% 
+    filter(date %in% dates$date)
+
+# add a variable for shape for the max 
+main <- select(main_bloom,date,type,year) %>% mutate(shape="max")
+
+
+data %>% 
+    filter(date %in% dates$date) %>% 
+    # add the factor for shape
+    left_join(main) %>% 
+    mutate(shape=ifelse(is.na(shape),"smoothed",shape)) %>% 
+    # reorder the resolutions 
+    mutate(type=factor(type, levels=c("Hourly","Daily","Satellite","NBPTS"))) %>%
+    arrange(type,date) %>%
+    ggplot() + 
+    geom_point(aes(x=date,y=vol,color=type,shape=shape,size=shape)) + 
+    scale_shape_manual(values=c(8,19)) + 
+    scale_size_manual(values=c(2,1.5)) + 
+    geom_line(sdata,mapping=aes(x=date,y=svol),alpha=0.5) + 
+    geom_hline(yintercept=ymed$t[ymed$type=="Hourly"], linetype="dashed") + 
+    scale_color_manual(values=c("grey85","#F2AD00","#00A08A","#FF0000")) + 
+    facet_wrap(.~year,scales="free_x") + 
+    theme_classic() + 
+    #scale_y_continuous(limits=c(0,5500000),
+    #                   labels = label_comma()) + 
+    labs(x="",y=~ bold("Biovolume " (mu * m^3/mL)),
+         color="Resolution") + 
+    theme(text=element_text(size=12),
+          axis.title.y = element_text(face="bold"))
+
+# for publication 
+data %>%
+    filter(date %in% dates$date) %>% 
+    # add the factor for shape
+    left_join(main) %>% 
+    mutate(shape=ifelse(is.na(shape),"round",shape)) %>% 
+    # reorder the resolutions 
+    mutate(type=factor(type, levels=c("Hourly","Daily","Satellite","NBPTS"))) %>%
+    arrange(type,date) %>%
+    ggplot() + 
+    geom_point(aes(x=date,y=vol,color=type,shape=shape,size=shape),alpha=0.6) + 
+    scale_shape_manual(values=c(8,19)) + 
+    scale_size_manual(values=c(3,1.5)) + 
+    geom_line(sdata,mapping=aes(x=date,y=svol),alpha=0.5) + 
+    geom_hline(yintercept=ymed$t[ymed$type=="Hourly"], linetype="dashed") + 
+    scale_color_manual(values=c("grey85","#F2AD00","#00A08A","#FF0000")) + 
+    facet_wrap(.~year,scales="free_x") + 
+    theme_classic() + 
+    scale_y_continuous(labels = label_comma()) + 
+    labs(x="",y=~ bold("Biovolume " (mu * m^3/mL)),
+         color="Resolution") + 
+    theme(text=element_text(size=12),
+          axis.title.y = element_text(face="bold"),
+          strip.text = element_blank(), 
+          strip.background = element_blank(),
+          legend.position="none")
+```
+
+```{r}
+ggsave(path = "../figures/", filename="Fig4.tiff", width = 5, height = 3, device='tiff', dpi=300, units="in",scale=1.5)
+```
+
+## Major bloom length
+
+How long are each bloom?
+
+```{r}
+starttime %>% 
+    arrange(type,year,desc(time)) %>%
+    group_by(type,year) %>% 
+    summarize(diff=(lead(date)-date)) %>% 
+    drop_na(diff) %>% 
+    mutate(type=factor(type, levels=c("Hourly","Daily","Satellite","NBPTS"))) %>%
+    ggplot(aes(x=type,y=diff,fill=type)) +
+    geom_col() +
+    scale_fill_manual(values=c("grey85","#F2AD00","#00A08A","#FF0000")) + 
+    facet_wrap(.~year) + 
+    theme_classic() + 
+    theme(legend.position="none",
+          text=element_text(size=12)) + 
+    labs(x="",y="Bloom length (days)")
+```
+
+# Peaks
+
+------------------------------------------------------------------------
+
+## Give a number each peak
+
+To determine peaks throughout the time series, I use different criteria based on the resolutions:
+
+-   NBPTS: 1 value is enough and if there is more than 10 days between values, they are considered different peaks
+-   Daily, Hourly: fill in missing data for 72h and then if more than 73h between peaks = different peak,
+-   Satellite: fill in at most 5 days and if more than 5 days +1 hour between peaks = different peaks (4.3 is the average range between available satellite data)
+
+```{r}
+#### NBPTS #### 
+pNBPTS = filter(start,type=="NBPTS") %>% 
+        # add index if above threshold = 1
+        mutate(idx=ifelse(vol < t,0,1)) %>% 
+        filter(idx==1) %>% 
+        mutate(diff=lead(date)-date) %>% 
+    # assign a unique number everytime the difference is more than 9 days = end of a bloom
+        mutate(time=ifelse(diff > 9 | is.na(diff),row_number(),NA)) %>% 
+    mutate(time=na_locf(time,option="nocb")) %>% 
+        # only keep data with volume data
+    filter(!(is.na(vol)))
+
+
+#### Satellite #### 
+pSat = filter(start,type=="Satellite") %>% 
+    # fill NAs for 5 days at most (forces it to have the diff in hours later)
+        mutate(navol=na_locf(vol,maxgap=(24*5))) %>% 
+        # add index if above threshold = 1
+        mutate(idx=ifelse(navol < t,0,1)) %>% 
+        filter(idx==1) %>% 
+        mutate(diff=lead(date)-date) %>% 
+    # assign a unique number everytime the difference is more than 3 days = end of a bloom
+        mutate(time=ifelse(diff > 24*5+1 | is.na(diff),row_number(),NA)) %>% 
+    mutate(time=na_locf(time,option="nocb")) %>% 
+        # only keep data with volume data
+    filter(!(is.na(vol)))
+
+
+#### Daily #### 
+pday <- filter(start,type=="Daily") %>%
+    # fill NAs for 72 hours at most
+        mutate(navol=na_locf(vol,maxgap=73)) %>% 
+    # add index if above threshold = 1
+        mutate(idx=ifelse(navol < t,0,1)) %>% 
+        filter(idx==1) %>% 
+        mutate(diff=lead(date)-date) %>% 
+    # only keep data with volume data
+    # assign a unique number everytime the difference is more than 4 days = end of a bloom
+        mutate(time=ifelse(diff > 74 | is.na(diff),row_number(),NA)) %>% 
+    mutate(time=na_locf(time,option="nocb")) %>% 
+            filter(!(is.na(vol)))
+
+#### Hourly #### 
+phour <- filter(start,type=="Hourly") %>%
+    # fill NAs for 9 days at most
+        mutate(navol=na_locf(vol,maxgap=73)) %>% 
+    # add index if above threshold = 1
+        mutate(idx=ifelse(navol < t,0,1)) %>% 
+        filter(idx==1) %>% 
+        mutate(diff=lead(date)-date) %>% 
+    # assign a unique number everytime the difference is more than 4 days
+        mutate(time=ifelse(diff > 74 | is.na(diff),row_number(),NA)) %>% 
+    mutate(time=na_locf(time,option="nocb")) %>% 
+        # only keep data with volume data
+            filter(!(is.na(vol)))
+```
+
+Now that we have our peaks for each, we can do 3 things:
+
+-   look at the number of peaks
+-   look at the length of the peaks
+-   plot the peaks shape
+-   location of the peaks
+
+## Number of peaks
+
+```{r}
+nbp <- bind_rows(pNBPTS,pSat,pday,phour) %>% 
+    distinct(type,time) %>% 
+    count(type)
+
+pnumber <- nbp %>% 
+    mutate(type=factor(type, levels=rev(c("Hourly","Daily","Satellite","NBPTS")))) %>%
+    ggplot(aes(x=type,y=n,fill=type)) + 
+    geom_col() + 
+    scale_fill_manual(values=rev(c("grey85","#F2AD00","#00A08A","#FF0000"))) + 
+    theme_bw() + 
+      theme(text=element_text(size=12),
+            panel.border = element_blank(),
+            legend.position="none",
+            panel.grid.major.x = element_blank(),
+            axis.title.y=element_text(face="bold")) + 
+      scale_y_continuous(breaks = seq(from = 0, to = 30, by = 10), 
+          minor_breaks = seq(from = 5, to = 25, by = 10)) + 
+    labs(y="# above threshold",x="") 
+pnumber 
+```
+
+## Duration of peaks
+
+Let's see how long those peaks last:
+
+```{r}
+# calculate the length of each peak
+long <- bind_rows(pNBPTS,pSat,pday,phour) %>% 
+    group_by(type,time) %>% 
+    summarize(dureSec=max(date)-min(date)) %>% 
+    mutate(dure=as.numeric(dureSec/60/60/24)) %>% 
+    # update the 0s 
+    mutate(dure=case_when(dureSec==0 & type %in% c("Satellite","NBPTS","Daily")~1,
+                          dureSec==0 & type=="Hourly"~1/24,
+                          TRUE ~ dure))
+
+# calculate the mean 
+centrality_df <- long %>% 
+    group_by(type) %>% 
+    summarize(M=mean(dure),n=n()) %>% 
+    mutate(lab=expression(paste(mu,"=",round(M,1),sep="")),
+           N=paste("n=",n,sep=""))
+
+# plot
+plength <- long %>% 
+    mutate(type=factor(type, levels=rev(c("Hourly","Daily","Satellite","NBPTS")))) %>%
+    ggplot(mapping = aes(x=type, y=dure)) +
+    # add the lengths as points 
+    geom_point(position = ggplot2::position_jitterdodge(dodge.width = 0.60),
+                             alpha = 0.4,
+                             size = 3,
+                             stroke = 0,
+                             na.rm = TRUE,
+               aes(color=type)) +
+    # add the boxplot
+    geom_boxplot(outlier.shape = NA,width = 0.4, alpha = 0, na.rm = TRUE) +
+    # add the violin plot 
+    geom_violin(width = 0.6, alpha = 0, na.rm = TRUE) + 
+    # add the 7 days 
+    geom_hline(yintercept=7,linetype="dashed") + 
+    # add the mean 
+    geom_point(mapping = aes(x=type, y=M),
+      data = centrality_df,
+      inherit.aes = FALSE,
+      size = 5, color = "darkred") + 
+     ggrepel::geom_label_repel(data = centrality_df,
+      mapping = aes(x=type, y=M, label = lab),
+      inherit.aes = FALSE,
+      size = 3,nudge_x = 0.4, segment.linetype = 4,min.segment.length = 0) + 
+     geom_text(data = centrality_df, mapping = aes(x = type, y = -2, label = N, fill = NULL), size = 4) + 
+    scale_color_manual(values=rev(c("grey85","#F2AD00","#00A08A","#FF0000"))) +
+     theme_bw() + 
+     theme(legend.position="none",
+           text=element_text(size=12),
+           axis.title.y = element_text(face="bold"),
+            panel.border = element_blank(),
+            panel.grid.major.x = element_blank()) +
+     scale_y_continuous(breaks = seq(from = 0, to = 80, by = 10)) + 
+     labs(x="",y="Above threshold length (in days)")
+plength
+```
+
+We can plot the distribution for the hourly data:
+
+```{r}
+long %>% 
+    filter(type=="Hourly") %>%
+    ggplot(aes(x=dure)) + 
+    geom_histogram(fill="black",color="white") + 
+    geom_vline(xintercept=7,linetype="dashed",color="grey80") + 
+    theme_bw() + 
+    theme(text=element_text(size=12),
+           axis.title.x = element_text(size=12),
+           panel.border = element_blank(),
+#           panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank()) +
+     scale_y_continuous(breaks = seq(from = 0, to = 8, by = 2)) + 
+     labs(y="Counts",x="Above threshold length (in days)") +
+    ggtitle("Distribution of peak length for the hourly data")
+```
+
+```{r}
+plot_grid(pnumber,plength,ncol=2,rel_widths=c(1,2.5),labels="auto")
+```
+
+```{r}
+ggsave(path = "../figures/", filename="Fig5.tiff", width = 5, height = 2, device='tiff', dpi=300, units="in",scale=1)
+```
+
+## Location of peaks
+
+```{r}
+loc <- bind_rows(pNBPTS,pSat,pday,phour) %>% 
+    mutate(peak="peak") %>% 
+    select(type,date,peak,time) %>% 
+    right_join(data)
+
+# plot with peak number
+loc %>%
+    drop_na(vol) %>% 
+    mutate(type=factor(type, levels=rev(c("Hourly","Daily","Satellite","NBPTS")))) %>%
+    ggplot(aes(x=date,y=vol,color=time)) + 
+    geom_line(size=1) +
+    geom_point() +
+    facet_wrap(.~type) + 
+    theme_classic() + 
+    scale_color_viridis_c() + 
+    scale_y_continuous(labels = label_comma()) + 
+    labs(x="",y="Biovolume (um3/mL)") + 
+    theme(text=element_text(size=12),
+          axis.title.y=element_text(face="bold"),
+          legend.position="none") + 
+    ggtitle("Peaks colored by peak number")
+
+
+# plot with peak length
+loc %>%
+    drop_na(vol) %>% 
+    mutate(type=factor(type, levels=rev(c("Hourly","Daily","Satellite","NBPTS")))) %>%
+    left_join(long) %>% 
+    ggplot(aes(x=date,y=vol,color=dure)) + 
+    geom_line(size=1) +
+    geom_point() +
+    facet_wrap(.~type) + 
+    theme_classic() + 
+    scale_color_viridis_c() + 
+    scale_y_continuous(labels = label_comma()) + 
+    labs(x="",y="Biovolume (um3/mL)",color="Peak length") + 
+    theme(text=element_text(size=12),
+          axis.title.y=element_text(face="bold")) + 
+    ggtitle("Peaks colored by length")
+```

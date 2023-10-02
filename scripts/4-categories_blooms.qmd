@@ -1,0 +1,1081 @@
+---
+title: "Detect phytoplankton categories blooms" # title of the notebook
+author: "Virginie Sonnet" 
+date: 2023-10-01
+description: 
+    This script detects phytoplankton classes blooms at different resolutions. 
+html: 
+theme: sandstone
+#mainfont: "LM Roman"
+fontsize: 0.99em
+toc: true # table of contents
+toc-depth: 5 
+toc-location: left # table of contents on the left 
+lightbox: TRUE # allows to click on an image to zoom in the HTML document
+embed-resources: true # avoid having dependencies in an extra folder
+smooth-scroll: true
+editor: visual
+code-overflow: wrap
+code-fold: true
+number-sections: true
+execute:
+    eval: true # run the code chunks FALSE/TRUE
+    echo: true # print the source code FALSE/TRUE
+    error: true # print error messages FALSE/TRUE
+    message: false # print any message FALSE/TRUE
+    warning: false # print warning message FALSE/TRUE
+    cache: false 
+---
+
+```{r}
+#| eval: false
+#| echo: false
+
+Other outputs: pdf_document, html_notebook, word_document 
+The HTML below just says to use the "LM Roman" family as font (kind of Arial?) and if you want the Latex font, you just need "Latin Modern Roman". The line below indicates that the text has to be justified. 
+```
+
+```{r}
+#| include: false
+
+# make sure that no object is in the environment and collect the garbage 
+rm(list=ls())
+gc()
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(castr)
+library(imputeTS)
+library(photobiology)
+
+library(scales)
+library(ggstatsplot)
+library(cowplot)
+```
+
+# Introduction
+
+------------------------------------------------------------------------
+
+This script computes, for each selected class, a figure that includes:
+
+-   time series
+
+-   number of blooms detected per resolution
+
+-   bloom length detected at the hourly resolution
+
+-   daily and tidal average cycle
+
+-   daily variation ratio
+
+```{r}
+data <- read_csv("../data/processed_gsoIFCB_resampled_classes.csv") %>%
+    # convert to EST/EDT
+    mutate(date=with_tz(date,"America/New_York")) %>% 
+    mutate(plot_date = `year<-`(date, 2020))
+
+# select the species to use
+data <- data %>% 
+     filter(sp %in% c("A. glacialis",
+                      "L. minimus",
+                      "A. sanguinea",
+                      "Mesodinium sp.",
+                      "C. pelagica",
+                      "Licmophora sp.",
+                      "dinophysiales",
+                      "Dinobryon sp.",
+                      "Chaetoceros spp. chain",
+                      "O. aurita",
+                      "M. polykrikoides",
+                      "silicoflagellates",
+                      "Chaetoceros spp. single",
+                      "O. mobiliensis",
+                      "protozoa",
+                      "Cylindrotheca sp.",
+                      "Pseudo-nitzschia spp.",
+                      "ceratiaceae",
+                      "D. blavyanus",
+                      "Rhizosolenia spp.",
+                      "Eucampia sp.",
+                      "Skeletonema spp.",
+                      "Guinardia sp.",
+                      "S. unipunctata",
+                      "T. nitzschioides",
+                      "Thalassiosira spp."))
+```
+
+# Preparation
+
+------------------------------------------------------------------------
+
+## Threshold and smoothing
+
+First the threshold, instead of using the median because of the very high 0 counts, I am using the mean:
+
+```{r}
+ymed <- data %>% 
+    group_by(sp,type) %>% 
+    summarize(t=mean(vol,na.rm=TRUE)+5*mean(vol,na.rm=TRUE)/100)
+```
+
+To plot the time series, a big smoothing helps visualize (k=24 and n=30) while for the major blooms a smaller window is better (k=3,n=30).
+
+```{r}
+sdata <- data %>%
+    filter(type=="Hourly") %>%
+    arrange(sp,date) %>% 
+    group_by(sp) %>% 
+    mutate(sts=smooth(vol,k=24,n=30),
+           sbloom=smooth(vol,k=3,n=30)) %>% 
+    left_join(ymed) %>% 
+    ungroup()
+```
+
+## Major bloom
+
+### Calculation
+
+I need the max for each year, assuming it is above the threshold.
+
+```{r}
+# calculate the start
+main_bloom <- sdata %>% 
+        # get the max per year assuming it is above the threshold
+        group_by(year,sp) %>% 
+        filter(vol==max(vol,na.rm=TRUE) & vol > t)
+```
+
+Calculate the bloom start and end date for all species.
+
+```{r}
+
+starttime <- tibble()
+
+
+for (i in unique(sdata$year)){
+    for (j in unique(sdata$sp)){
+    
+    # get the calculated max 
+    max <- filter(main_bloom,year==i & sp==j)
+    
+    # detect the start date of the bloom
+    stemp <- filter(sdata,year==i & sp==j & date <= max$date[1]) %>% arrange(desc(date)) %>%
+        # change all NA values for 999999999999 time to take care of the below threshold ones
+        mutate(navol=ifelse(is.na(vol),999999999999,vol)) %>% 
+        # convert below threshold values to NA and fill in at most 12 values
+        mutate(navol=ifelse(navol <= t,NA,navol)) %>% 
+        mutate(navol=na_locf(navol,maxgap=12)) %>% 
+        # put the ones that weren't converted back to below threshold vol values
+        mutate(navol=ifelse(is.na(navol),vol,navol)) %>% 
+        # put the 999999999999 values back to NA
+        mutate(navol=ifelse(navol==999999999999,NA,navol)) %>%
+        # fill in NAs for 72h
+        mutate(navol=na_locf(navol,maxgap=73)) %>% 
+        # add index 1 if above threshold
+        mutate(idx=ifelse(is.na(navol) | navol < t,0,1)) %>% 
+        # select the start date: sum all the idx and when it doesn't change = start date
+        mutate(s=cumsum(idx)) %>% 
+        mutate(diff=lead(s)-s) %>% 
+        filter(diff==0) %>% 
+        # add the fact that it's the start
+        mutate(time="start")
+    
+    # if there is no start date then assign the beginning of the Year
+    if (nrow(stemp) == 0){
+        # reorder to have the first day of the year
+        stemp <- filter(sdata,year==i & sp==j & date <= max$date[1]) %>% 
+            # add the fact that it's the start
+            mutate(time="start")
+        starttime=bind_rows(starttime,stemp[1,])
+    } else {
+        starttime=bind_rows(starttime,stemp[1,])
+    }
+    
+    
+    # detect the end date of the bloom
+    etemp <- filter(sdata,year==i & sp==j & date >= max$date[1]) %>% 
+        # change all NA values for 999999999999 time to take care of the below threshold ones
+        mutate(navol=ifelse(is.na(vol),999999999999,vol)) %>% 
+        # convert below threshold values to NA and fill in at most 12 values
+        mutate(navol=ifelse(navol <= t,NA,navol)) %>% 
+        mutate(navol=na_locf(navol,maxgap=12)) %>% 
+        # put the ones that weren't converted back to below threshold vol values
+        mutate(navol=ifelse(is.na(navol),vol,navol)) %>% 
+        # put the 999999999999 values back to NA
+        mutate(navol=ifelse(navol==999999999999,NA,navol)) %>%
+        # fill in NAs for 72h
+        mutate(navol=na_locf(navol,maxgap=73)) %>% 
+        # add index 1 if above threshold
+        mutate(idx=ifelse(is.na(navol) | navol < t,0,1)) %>% 
+        # select the start date: sum all the idx and when it doesn't change = start date
+        mutate(s=cumsum(idx)) %>% 
+        mutate(diff=lead(s)-s) %>% 
+        filter(diff==0) %>% 
+        # add the fact that it's the end
+        mutate(time="end")
+    
+        starttime=bind_rows(starttime,etemp[1,])
+    }
+}
+
+
+# correct manually 
+
+# eucampia, the bloom starts earlier but there are too many missing data so it doesn't detect it 
+starttime$date[starttime$sp=="Eucampia sp." & starttime$time=="start" & starttime$year=="Year 2"] <- ymd_hms("2019-06-21 12:00:00",tz="America/New_York")
+
+# pseudo-nitzschia, the bloom is in June although the max is in April
+starttime$date[starttime$sp=="Pseudo-nitzschia sp." & starttime$time=="start" & starttime$year=="Year 1"] <- ymd_hms("2018-05-30 13:00:00",tz="America/New_York")
+starttime$date[starttime$sp=="Pseudo-nitzschia sp." & starttime$time=="end" & starttime$year=="Year 1"] <- ymd_hms("2018-05-30 01:00:00",tz="America/New_York")
+
+# thalassionema, the bloom is in August, not September 
+starttime$date[starttime$sp=="T. nitzschioides" & starttime$time=="start" & starttime$year=="Year 2"] <- ymd_hms("2019-08-14 10:00:00",tz="America/New_York")
+starttime$date[starttime$sp=="T. nitzschioides" & starttime$time=="end" & starttime$year=="Year 2"] <- ymd_hms("2019-08-29 10:00:00",tz="America/New_York")
+```
+
+We need to create the dates vector that correspond to each major bloom for the classes:
+
+```{r}
+dates <- tibble()
+
+for (i in unique(starttime$sp)){
+    ttime <- filter(starttime, sp==i) %>% 
+        arrange(date)
+    tdates <- tibble(date=c(seq(ttime$date[1],ttime$date[2],by="hour"), # 2018
+                          seq(ttime$date[3],ttime$date[4],by="hour")), # 2019
+                     sp=i) 
+    dates <- bind_rows(dates,tdates)
+}
+```
+
+### Metrics
+
+A few metrics I need for each species:
+
+-   if there isn't a major bloom
+-   main month of each year bloom
+-   length of each year bloom
+-   ratio of magnitude
+-   highest year
+
+```{r}
+# any that has no end or start date? 
+filter(starttime, is.na(date))
+
+
+year_metrics <- dates %>% 
+    # only get the smoothed hourly data for the major blooms dates
+    left_join(sdata) %>% 
+    # get the length
+    group_by(sp,year) %>% 
+    mutate(length=max(date)-min(date)) %>% 
+    # maximum per year 
+    mutate(max=max(vol,na.rm=TRUE)) %>% 
+    # main month 
+    mutate(month=month(date,abbr=TRUE,label=TRUE)) %>% 
+    add_count(sp,year,month) %>% 
+    filter(n==max(n,na.rm=TRUE)) %>% 
+    distinct(sp,year,length,max,month) 
+    
+comparison_metrics <- year_metrics %>% 
+    group_by(sp) %>% 
+    summarize(magnitude=max(max)/min(max),
+              highest=year[max==max(max)])
+```
+
+## Number of blooms and bloom length
+
+### Calculation
+
+I use the same criteria as for the community blooms:
+
+-   NBPTS: 1 value is enough and if there is more than 10 days between values, they are considered different peaks
+-   Daily, Hourly: fill in missing data for 72h and then if more than 73h between peaks = different peak,
+-   Satellite: fill in at most 5 days and if more than 5 days +1 hour between peaks = different peaks (4.3 is the average range between available satellite data)
+
+An extra criteria for the Hourly data is applied: they have to be at least 3 hours long.
+
+```{r}
+start <- data %>% 
+        left_join(ymed)
+allblooms <- tibble()
+
+for (i in unique(data$sp)){
+    temp <- filter(start,sp==i)
+    
+    #### NBPTS #### 
+    pNBPTS = filter(temp,type=="NBPTS") %>% 
+            # add index if above threshold = 1
+            mutate(idx=ifelse(vol < t,0,1)) %>% 
+            filter(idx==1) %>% 
+            mutate(diff=lead(date)-date) %>% 
+        # assign a unique number everytime the difference is more than 9 days = end of a bloom
+            mutate(time=ifelse(diff > 9 | is.na(diff),row_number(),NA)) %>% 
+        mutate(time=na_locf(time,option="nocb")) %>% 
+            # only keep data with volume data
+        filter(!(is.na(vol)))
+    
+    
+    #### Satellite #### 
+    pSat = filter(temp,type=="Satellite") %>% 
+        # fill NAs for 5 days at most (forces it to have the diff in hours later)
+            mutate(navol=na_locf(vol,maxgap=(24*5))) %>% 
+            # add index if above threshold = 1
+            mutate(idx=ifelse(navol < t,0,1)) %>% 
+            filter(idx==1) %>% 
+            mutate(diff=lead(date)-date) %>% 
+        # assign a unique number everytime the difference is more than 3 days = end of a bloom
+            mutate(time=ifelse(diff > 24*5+1 | is.na(diff),row_number(),NA)) %>% 
+        mutate(time=na_locf(time,option="nocb")) %>% 
+            # only keep data with volume data
+        filter(!(is.na(vol)))
+    
+    
+    #### Daily #### 
+    pday <- filter(temp,type=="Daily") %>%
+        # fill NAs for 72 hours at most
+            mutate(navol=na_locf(vol,maxgap=73)) %>% 
+        # add index if above threshold = 1
+            mutate(idx=ifelse(navol < t,0,1)) %>% 
+            filter(idx==1) %>% 
+            mutate(diff=lead(date)-date) %>% 
+        # only keep data with volume data
+        # assign a unique number everytime the difference is more than 4 days = end of a bloom
+            mutate(time=ifelse(diff > 74 | is.na(diff),row_number(),NA)) %>% 
+        mutate(time=na_locf(time,option="nocb")) %>% 
+                filter(!(is.na(vol)))
+    
+    #### Hourly #### 
+    phour <- filter(temp,type=="Hourly") %>%
+        # fill NAs for 9 days at most
+            mutate(navol=na_locf(vol,maxgap=73)) %>% 
+        # add index if above threshold = 1
+            mutate(idx=ifelse(navol < t,0,1)) %>% 
+            filter(idx==1) %>% 
+            mutate(diff=lead(date)-date) %>% 
+        # assign a unique number everytime the difference is more than 4 days
+            mutate(time=ifelse(diff > 74 | is.na(diff),row_number(),NA)) %>% 
+        mutate(time=na_locf(time,option="nocb")) %>% 
+            # only keep data with volume data
+                filter(!(is.na(vol)))
+    
+    allblooms <- bind_rows(allblooms,pNBPTS,pSat,pday,phour)
+}
+
+# remove the blooms that are less than 3h long
+allblooms <- allblooms %>% group_by(sp,type,time) %>% filter(type != "Hourly" | (type == "Hourly" & n()>2))
+```
+
+### Metrics
+
+The metrics I want are:
+
+-   number of blooms at the hourly level
+-   minimum, average and maximum bloom length
+
+```{r}
+bloom_metrics <- allblooms %>% 
+    filter(type=="Hourly") %>% 
+    group_by(sp) %>% 
+    # number of blooms 
+    mutate(nb=length(unique(time))) %>% 
+    # calculate bloom lengths 
+    group_by(sp,time,nb) %>% 
+    summarize(dure=(max(date)-min(date))/24/60/60) %>% 
+    # calculate bloom length metrics
+    group_by(sp,nb) %>% 
+    summarize(bmin=as.numeric(min(dure)),
+              bavg=as.numeric(mean(dure)),
+              bmax=as.numeric(as.numeric(max(dure))))
+
+
+perc_metrics <- allblooms %>% 
+        filter(type=="Hourly") %>%
+        group_by(sp,time) %>% 
+        summarize(dure=max(date)-min(date)) %>% 
+        add_count(sp,name="tot") %>% 
+        filter(dure < 7*24*60*60) %>% 
+        count(tot) %>% 
+        mutate(p=n*100/tot) %>% 
+    select(sp,p)
+
+bloom_metrics <- left_join(bloom_metrics,perc_metrics)
+```
+
+## Daily variations
+
+### Daily cycle
+
+For each species, I want to calculate the daily average cycle.
+
+```{r}
+davg <- data %>% 
+    filter(type=="Hourly") %>% 
+    mutate(hour=hour(date)) %>% 
+    group_by(sp,hour) %>% 
+    summarize(vol=mean(vol,na.rm=TRUE))
+```
+
+### Tidal cycle
+
+For the tidal cycle I'm going to need data from the NOAA Quonset Point dataset:
+
+```{r}
+# get the tides data 
+tides <- read_csv("../data/NBay_hourly_GSO_nuts.csv",guess_max=180000) %>% 
+    mutate(date=with_tz(date,tzone="America/New_York")) %>% 
+    filter(date > "2017-11-01" & date < "2019-11-01") %>% 
+    select(date,wlevel) %>% 
+    mutate(num_date=as.numeric(date))
+
+# get the maximum water levels 
+peaks=get_peaks(tides$num_date,tides$wlevel,span=5,strict=FALSE)
+
+# create tide cycles 
+tides <- tides %>% 
+    # create tides groups 
+    mutate(status=ifelse(num_date %in% peaks$x, row_number(),NA)) %>% 
+    mutate(status=na_locf(status,na_remaining="keep")) %>% 
+    # create tides cycle (removing the first and last group that have 
+    # NA values due to the locf in reverse direction)
+    drop_na(status) %>% 
+    group_by(status) %>%
+    filter(n() <= 13 & n() >= 11) %>% 
+    mutate(time=row_number()) 
+
+# calculate the average tidal cycle
+tavg <- data %>% 
+    filter(type=="Hourly") %>% 
+    left_join(tides) %>% 
+    # remove the missing data from the tides dataset that produced NAs 
+    drop_na(status) %>% 
+    group_by(sp,time) %>% 
+    summarize(vol=mean(vol,na.rm=TRUE))
+```
+
+### Daily ratio
+
+```{r}
+ratiowith0 <- data %>% 
+    filter(type=="Hourly") %>% 
+    mutate(day=floor_date(date,"day")) %>% 
+    group_by(day, sp) %>% 
+    summarize(maxvol = max(vol,na.rm=TRUE),
+              minvol= min(vol,na.rm=TRUE)) %>% 
+    # a ratio cannot be computed if the value is 0 so I'll change it for 1
+    mutate(maxvol=ifelse(maxvol==0,1,maxvol),
+           minvol=ifelse(minvol==0,1,minvol)) %>% 
+    mutate(ratio=maxvol/minvol,diff=maxvol-minvol) %>% 
+    # remove the days without sampled values
+    drop_na(ratio) %>% 
+    ungroup()
+
+rationo0 <- data %>% 
+    filter(type=="Hourly" & vol != 0) %>% 
+    mutate(day=floor_date(date,"day")) %>% 
+    group_by(day, sp) %>% 
+    summarize(maxvol = max(vol,na.rm=TRUE),
+              minvol= min(vol,na.rm=TRUE)) %>% 
+    mutate(ratio=maxvol/minvol,diff=maxvol-minvol) %>% 
+    # remove the days without sampled values
+    drop_na(ratio) %>% 
+    ungroup()
+
+
+ratio_metrics <- rationo0 %>% 
+    group_by(sp) %>% 
+    summarize(avgratio=mean(ratio),stdratio=sd(ratio))
+```
+
+## Metrics
+
+```{r}
+metrics <- left_join(bloom_metrics,comparison_metrics) %>% 
+    left_join(ratio_metrics)
+```
+
+```{r}
+write_csv(year_metrics, "../data/results_year_comparison_metrics.csv")
+write_csv(metrics, "../data/results_species_metrics.csv")
+```
+
+# Plots
+
+------------------------------------------------------------------------
+
+```{r,fig.width = 8, fig.height = 8.5}
+
+
+for (i in unique(data$sp)){
+    print(i)
+    
+    temp <- filter(sdata,sp==i)
+    
+    #### Time series ####
+    pts <- temp %>% 
+        select(date,vol,sts) %>% 
+        pivot_longer(vol:sts,names_to="process",values_to="vol") %>%
+        mutate(process=factor(process,levels=c("vol","sts"))) %>% 
+        ggplot(aes(x=date,y=vol,color=process)) + 
+        geom_line() + 
+        geom_hline(yintercept=ymed$t[ymed$sp==i & ymed$type=="Hourly"],
+                   linetype="dashed",color="orangered4") + 
+        scale_color_manual(values=c("grey80","black")) + 
+        scale_y_continuous(labels=label_comma()) + 
+        theme_classic() + 
+        theme(text=element_text(size=12),
+              axis.title.y=element_text(face="bold",size=11),
+              legend.position="none") + 
+        labs(x="",y="Biovolume")  + 
+        ggtitle(i)
+    print(pts) 
+    
+    
+    #### Major bloom ####
+    temp <- temp %>% 
+        filter(date %in% dates$date[dates$sp==i]) %>% 
+        bind_rows(data %>% 
+                      filter(sp==i & type != "Hourly" & 
+                                 date %in% dates$date[dates$sp==i]))
+    
+    
+    pmaj <- temp %>% 
+        # reorder the resolutions 
+        mutate(type=factor(type, levels=c("Hourly","Daily","Satellite","NBPTS"))) %>%
+        arrange(type,date) %>%
+        ggplot() + 
+        geom_point(aes(x=plot_date,y=vol,color=type,shape=year),alpha=0.6) + 
+        scale_shape_manual(values=c(15,19)) + 
+        geom_line(data=filter(temp, type=="Hourly"),aes(x=plot_date,y=sbloom,group=year)) + 
+        geom_hline(yintercept=unique(temp$t), linetype="dashed",color="orangered4") + 
+        scale_color_manual(values=c("grey85","#F2AD00","#00A08A","#FF0000")) + 
+        theme_classic() + 
+        scale_y_continuous(labels = label_comma()) + 
+        labs(x="",y="Biovolume",
+             color="Resolution",
+             shape="Year") + 
+        theme(text=element_text(size=12),
+              axis.title.y = element_text(face="bold",size=11),
+              legend.title=element_text(face="bold"),
+              legend.position="none")
+    print(pmaj) 
+    
+    
+    #### Number of blooms #### 
+    nbp <- allblooms %>% 
+        filter(sp==i) %>% 
+        distinct(type,time) %>% 
+        count(type)
+    
+    pnumber <- nbp %>% 
+        mutate(type=factor(type, levels=rev(c("Hourly","Daily","Satellite","NBPTS")))) %>%
+        ggplot(aes(x=type,y=n,fill=type)) + 
+        geom_col() + 
+        scale_fill_manual(values=rev(c("grey85","#F2AD00","#00A08A","#FF0000"))) + 
+        theme_bw() + 
+          theme(text=element_text(size=12),
+                panel.border = element_blank(),
+                legend.position="none",
+                panel.grid.major.x = element_blank(),
+                axis.title.y=element_text(face="bold",size=11)) + 
+        labs(y="#peaks",x="") 
+    print(pnumber) 
+    
+    
+    #### Blooms length #### 
+    long <- allblooms %>% 
+        filter(sp==i) %>% 
+        group_by(type,time) %>% 
+        summarize(dure=max(date)-min(date)) %>% 
+        mutate(dure=as.numeric(dure/60/60/24))
+
+    # calculate the mean 
+    centrality_df <- long %>% 
+        group_by(type) %>% 
+        summarize(M=mean(dure),n=n()) %>% 
+        mutate(lab=paste("u=",round(M,1),sep=""),
+               N=paste("n=",n,sep=""))
+    
+    # plot
+    p <- long %>% 
+        mutate(type=factor(type, levels=rev(c("Hourly","Daily","Satellite","NBPTS")))) %>%
+        ggplot(mapping = aes(x=type, y=dure)) +
+        # add the lengths as points 
+        geom_point(position = ggplot2::position_jitterdodge(dodge.width = 0.60),
+                                 alpha = 0.4,
+                                 size = 3,
+                                 stroke = 0,
+                                 na.rm = TRUE,
+                   aes(color=type)) +
+        # add the boxplot
+        geom_boxplot(outlier.shape = NA,width = 0.4, alpha = 0, na.rm = TRUE) +
+        # add the violin plot 
+        geom_violin(width = 0.6, alpha = 0, na.rm = TRUE) + 
+        # add the 7 days 
+        geom_hline(yintercept=7,linetype="dashed") + 
+        # add the mean 
+        geom_point(mapping = aes(x=type, y=M),
+          data = centrality_df,
+          inherit.aes = FALSE,
+          size = 5, color = "darkred") + 
+         ggrepel::geom_label_repel(data = centrality_df,
+          mapping = aes(x=type, y=M, label = lab),
+          inherit.aes = FALSE,
+          size = 3,nudge_x = 0.4, segment.linetype = 4,min.segment.length = 0) + 
+         geom_text(data = centrality_df, mapping = aes(x = type, y = -2, label = N, fill = NULL), size = 4) + 
+        scale_color_manual(values=rev(c("grey85","#F2AD00","#00A08A","#FF0000"))) +
+         theme_bw() + 
+         theme(legend.position="none",
+               text=element_text(size=12),
+               axis.title.y = element_text(face="bold"),
+                panel.border = element_blank(),
+                panel.grid.major.x = element_blank()) +
+         labs(x="",y="Above threshold length (in days)")
+    print(p)
+    
+    # only keep the hourly
+    plength <- long %>% 
+        filter(type=="Hourly") %>%
+        ggplot(mapping = aes(x=type, y=dure)) +
+        # add the lengths as points 
+        geom_point(position = ggplot2::position_jitterdodge(dodge.width = 0.60),
+                                 alpha = 0.4,
+                                 size = 3,
+                                 stroke = 0,
+                                 na.rm = TRUE,
+                   aes(color=type)) +
+        # add the boxplot
+        geom_boxplot(outlier.shape = NA,width = 0.4, alpha = 0, na.rm = TRUE) +
+        # add the violin plot 
+        geom_violin(width = 0.6, alpha = 0, na.rm = TRUE) + 
+        # add the 7 days 
+        geom_hline(yintercept=7,linetype="dashed") + 
+        # add the mean 
+        geom_point(mapping = aes(x=type, y=M),
+          data = filter(centrality_df,type=="Hourly"),
+          inherit.aes = FALSE,
+          size = 5, color = "darkred") + 
+         ggrepel::geom_label_repel(data = filter(centrality_df,type=="Hourly"),,
+          mapping = aes(x=type, y=M, label = lab),
+          inherit.aes = FALSE,
+          size = 3,nudge_x = 0.4, segment.linetype = 4,min.segment.length = 0) + 
+         geom_text(data = filter(centrality_df,type=="Hourly"),, mapping = aes(x = type, y = -2, label = N, fill = NULL), size = 4) + 
+        scale_color_manual(values="grey85") +
+         theme_bw() + 
+         theme(legend.position="none",
+               text=element_text(size=12),
+               axis.title.y = element_text(face="bold",size=11),
+                panel.border = element_blank(),
+                panel.grid.major.x = element_blank()) +
+         labs(x="",y="Length (days)")
+    print(plength)
+    
+    
+    # percent of hourly peaks < 7 days 
+    perc <- long %>% 
+        filter(type=="Hourly") %>%
+        add_count(.,name="tot") %>% 
+        filter(dure < 7) %>% 
+        count(tot) %>% 
+        mutate(p=n*100/tot)
+    print(paste("For",i,", over the",perc$tot,"peaks detected at hourly resolution,",perc$n,"are under 7 days, the equivalent of",round(perc$p,2),"%."))
+    
+    #### Blooms location #### 
+    loc <- allblooms %>% 
+        filter(sp==i) %>% 
+        mutate(peak="peak") %>% 
+        select(type,date,peak,time) %>% 
+        right_join(filter(data,sp==i))
+    
+    # plot 
+    p <- loc %>%
+        drop_na(vol) %>% 
+        mutate(type=factor(type, levels=rev(c("Hourly","Daily","Satellite","NBPTS")))) %>%
+        left_join(long) %>% 
+        ggplot(aes(x=date,y=vol,color=dure)) + 
+        geom_line(size=1) +
+        geom_point() +
+        facet_wrap(.~type) + 
+        theme_classic() + 
+        scale_color_viridis_c() + 
+        scale_y_continuous(labels = label_comma()) + 
+        labs(x="",y="Biovolume (um3/mL)",color="Peak length") + 
+        theme(text=element_text(size=12),
+              axis.title.y=element_text(face="bold")) + 
+        ggtitle("Peaks colored by length")
+    print(p)
+    
+    
+    #### Cycles #### 
+    pday <- davg %>% 
+        filter(sp==i) %>% 
+        ggplot(aes(x=hour,y=vol)) + 
+        geom_line() + 
+        geom_point() + 
+        theme_classic() + 
+        scale_y_continuous(labels = label_comma()) + 
+        labs(x="",y="Hour vol") + 
+        theme_classic() + 
+        theme(text=element_text(size=12),
+        axis.title.y=element_text(face="bold",size=10)) 
+    print(pday)
+    
+    
+    ptide <- tavg %>% 
+        filter(sp==i) %>% 
+        ggplot(aes(x=time,y=vol)) + 
+        geom_line() + 
+        geom_point() + 
+        geom_vline(xintercept=6.5, color="blue4") + 
+        geom_text(aes(x=7.25,y=min(vol)+10,label="Low tide"),color="blue4") + 
+        theme_classic() + 
+        scale_y_continuous(labels = label_comma()) + 
+        labs(x="",y="Tide vol") + 
+        theme_classic() + 
+        theme(text=element_text(size=12),
+        axis.title.y=element_text(face="bold",size=10)) 
+    print(ptide)
+    
+    
+    #### Daily variation #### 
+    # without the 0 counts 
+    centrality_no0 <- rationo0 %>%
+        filter(sp==i) %>% 
+        group_by(sp) %>% 
+        summarize(M=mean(ratio),n=n()) %>% 
+        mutate(lab=paste("u=",round(M,1),sep=""),
+               N=paste("n=",n,sep=""))
+    
+    prationo0 <- rationo0 %>% 
+        filter(sp==i) %>% 
+        ggplot(mapping = aes(x=sp, y=ratio)) +
+        # add the lengths as points 
+        geom_point(position = ggplot2::position_jitterdodge(dodge.width = 0.60),
+                                 alpha = 0.4,
+                                 size = 3,
+                                 stroke = 0,
+                                 na.rm = TRUE,aes(color=sp)) +
+        # add the boxplot
+        geom_boxplot(outlier.shape = NA,width = 0.4, alpha = 0, na.rm = TRUE) +
+        # add the violin plot 
+        geom_violin(width = 0.6, alpha = 0, na.rm = TRUE) + 
+        # add the mean 
+        geom_point(mapping = aes(x=sp, y=M),
+          data = centrality_no0,
+          inherit.aes = FALSE,
+          size = 5, color = "darkred") + 
+         ggrepel::geom_label_repel(data = centrality_no0,
+          mapping = aes(x=sp, y=M, label = lab),
+          inherit.aes = FALSE,
+          size = 3,nudge_x = 0.4, segment.linetype = 4,min.segment.length = 0) + 
+        scale_color_manual(values="grey85") +
+         theme_bw() + 
+         theme(legend.position="none",
+               text=element_text(size=12),
+               axis.title.y = element_text(face="bold",size=11),
+                panel.border = element_blank(),
+                panel.grid.major.x = element_blank()) +
+         labs(x="",y="Ratio (no 0s)")
+    print(prationo0)
+    
+    # with the 0 counts 
+    centrality_0 <- ratiowith0 %>%
+        filter(sp==i) %>% 
+        group_by(sp) %>% 
+        summarize(M=mean(ratio),n=n()) %>% 
+        mutate(lab=paste("u=",round(M,1),sep=""),
+               N=paste("n=",n,sep=""))
+    
+    pratio0 <- ratiowith0 %>% 
+        filter(sp==i) %>% 
+        ggplot(mapping = aes(x=sp, y=ratio)) +
+        # add the lengths as points 
+        geom_point(position = ggplot2::position_jitterdodge(dodge.width = 0.60),
+                                 alpha = 0.4,
+                                 size = 3,
+                                 stroke = 0,
+                                 na.rm = TRUE,aes(color=sp)) +
+        # add the boxplot
+        geom_boxplot(outlier.shape = NA,width = 0.4, alpha = 0, na.rm = TRUE) +
+        # add the violin plot 
+        geom_violin(width = 0.6, alpha = 0, na.rm = TRUE) + 
+        # add the mean 
+        geom_point(mapping = aes(x=sp, y=M),
+          data = centrality_0,
+          inherit.aes = FALSE,
+          size = 5, color = "darkred") + 
+         ggrepel::geom_label_repel(data = centrality_0,
+          mapping = aes(x=sp, y=M, label = lab),
+          inherit.aes = FALSE,
+          size = 3,nudge_x = 0.4, segment.linetype = 4,min.segment.length = 0) + 
+        scale_color_manual(values="grey85") +
+         theme_bw() + 
+         theme(legend.position="none",
+               text=element_text(size=12),
+               axis.title.y = element_text(face="bold",size=11),
+                panel.border = element_blank(),
+                panel.grid.major.x = element_blank()) +
+         labs(x="",y="Ratio (with 0s)")
+    print(pratio0)
+    
+    
+    #### Combine #### 
+    p1 <- plot_grid(pmaj,pnumber,rel_widths=c(2,1),ncol=2,labels=c("b","c"))
+    p2 <- plot_grid(pday,ptide,nrow=2,labels=c("e","f"))
+    p3 <- plot_grid(plength,p2,pratio0,prationo0,ncol=4,labels=c("d","","g","h"))
+    ptot <- plot_grid(pts,p1,p3,nrow=3,labels=c("a","",""))
+    print(ptot)
+}
+```
+
+# Specific plots
+
+## Major blooms
+
+As an illustration, I'll use the major blooms of different species:
+
+-   Long blooms but variable so can be underestimated: D. blavyanus and Thalassiosira sp.
+
+-   Long blooms resolved at all resolutions: Skeletonema sp. and L. minimus
+
+-   \>7 days blooms but can be missed depending on the sampling days: Cerataulina sp. for the NBPTS and Chaetoceros sp. single by the satellite
+
+-   Short blooms: M. polykrikoides and Dinobryon sp.
+
+```{r}
+selected <- c("Skeletonema spp.","L. minimus",
+              "D. blavyanus","Thalassiosira spp.",
+              "C. pelagica","Chaetoceros spp. single",
+              "M. polykrikoides", "Dinobryon sp.")
+
+plist <- list()
+
+for (i in 1:length(selected)){
+
+    temp <- sdata %>% 
+        filter(sp==selected[i]) %>% 
+        filter(date %in% dates$date[dates$sp==selected[i]]) %>% 
+        bind_rows(data %>% 
+                      filter(sp==selected[i] & type != "Hourly" & 
+                                 date %in% dates$date[dates$sp==selected[i]]))
+    
+    
+    pmaj <- temp %>% 
+        mutate(type=ifelse(type %in% c("Daily","Satellite","NBPTS") | year=="Year 1",type,"Hourly2")) %>% 
+        # reorder the resolutions 
+        mutate(type=factor(type, levels=c("Hourly2","Hourly","Daily","Satellite","NBPTS"))) %>%
+        arrange(type,date) %>%
+        ggplot() + 
+        geom_point(aes(x=plot_date,y=vol,color=type,shape=year),alpha=0.6) + 
+        scale_shape_manual(values=c(15,19)) + 
+        geom_line(data=filter(temp, type=="Hourly"),aes(x=plot_date,y=sbloom,group=year)) + 
+        geom_hline(yintercept=unique(temp$t), linetype="dashed",color="orangered4") + 
+        scale_color_manual(values=c("grey60","grey85","#F2AD00","#00A08A","#FF0000")) + 
+        theme_classic() + 
+        scale_y_continuous(labels = label_comma()) + 
+        theme(text=element_text(size=12),
+              axis.title.y = element_text(face="bold",size=11),
+              legend.title=element_text(face="bold"),
+              legend.position="none") 
+    
+    # adjust the dates labels 
+    if (selected[i] !="Skeletonema sp."){
+        pmaj <- pmaj + 
+            scale_x_datetime(date_labels="%d \n%b")
+    }
+    
+    # only keep the y labels for the left side species
+    if (selected[i] %in% c("Skeletonema spp.",
+                           "D. blavyanus",
+                           "C. pelagica",
+                           "M. polykrikoides")){
+        pmaj <- pmaj + labs(x="",y=~ bold("Biovolume " (mu * m^3/mL)))
+    } else {
+        pmaj <- pmaj + labs(x="",y="")
+    }
+    
+    # adjust the species labels positioning
+    if (selected[i] %in% c("Skeletonema spp.",
+                           "L. minimus")){
+       pmaj <- pmaj + annotate("text",  x=max(temp$plot_date,na.rm=TRUE), y = Inf, label = selected[i],vjust=1,hjust=1,fontface = 'italic',size=4) 
+    } else if (selected[i] == "Chaetoceros sp. single") {
+        pmaj <- pmaj + annotate("text",  x=min(temp$plot_date,na.rm=TRUE), y = Inf, label = "Chaetoceros sp. \nsingle",vjust=1,hjust=0.05,fontface = 'italic',size=4) 
+    } else {
+        pmaj <- pmaj + 
+                    annotate("text",  x=min(temp$plot_date,na.rm=TRUE), y = Inf, label = selected[i],vjust=1,hjust=0.05,fontface = 'italic',size=4)
+    }
+    
+    plist[[i]] <- pmaj
+}
+
+plot_grid(plist[[1]],plist[[2]],
+          plist[[3]],plist[[4]],
+          plist[[5]],plist[[6]],
+          plist[[7]],plist[[8]],
+          nrow=4,ncol=2,align="vh",labels="auto")
+```
+
+```{r}
+ggsave(path = "../figures/", filename="Fig6.tiff", width = 5, height = 6, device='tiff', dpi=300, units="in",scale=1.75)
+```
+
+## Daily variability
+
+```{r}
+library(wesanderson)
+all <- read_csv("../data/Hitormiss_all.csv") %>% 
+    rename(sp=Sp,tcycle=`Tidal cycle`,
+           dcycle=`Daily cycle`)
+
+# daily cycle examples
+davg %>% 
+    filter(sp %in% c("A. sanguinea",
+                     "Guinardia sp.", "Chaetoceros spp. chain")) %>% 
+    ggplot(aes(x=hour,y=vol,color=sp)) + 
+    geom_line() + 
+    geom_point() + 
+    theme_classic() + 
+    scale_y_continuous(labels = label_comma()) + 
+    scale_color_manual(values=wes_palette("GrandBudapest1",3)) + 
+    labs(x="Hour",y="Mean biovolume") + 
+    theme_classic() + 
+    theme(text=element_text(size=12),
+          axis.title.y=element_text(face="bold"))
+
+# tidal cycle examples
+tavg %>% 
+    filter(sp %in% c("Eucampia sp.", "A. glacialis",
+                     "L. minimus")) %>% 
+    ggplot(aes(x=time,y=vol,color=sp)) + 
+    geom_line() + 
+    geom_point() + 
+    geom_vline(xintercept=6.5, color="black") + 
+    theme_classic() + 
+    scale_y_continuous(labels = label_comma()) + 
+    scale_color_manual(values=wes_palette("GrandBudapest1",3)) + 
+    labs(x="Tidal hour",y="Mean biovolume") + 
+    theme_classic() + 
+    theme(text=element_text(size=12),
+    axis.title.y=element_text(face="bold",size=10)) 
+
+# daily ratio examples 
+centrality_no0 <- rationo0 %>%
+        group_by(sp) %>% 
+        summarize(M=mean(ratio),n=n()) %>% 
+        mutate(lab=paste("u=",round(M,1),sep=""),
+               N=paste("n=",n,sep="")) %>% 
+        filter(sp %in% c("Skeletonema spp.", "A. sanguinea",
+                         "D. blavyanus", "Thalassiosira spp.",
+                         "Eucampia sp.", "A. glacialis")) %>% 
+        arrange(M)
+    
+    
+pratio <- rationo0 %>% 
+        ungroup() %>% 
+        mutate(sp=factor(sp,levels=unique(centrality_no0$sp))) %>% 
+        filter(sp %in% c("Skeletonema spp.", "A. sanguinea",
+                         "D. blavyanus", "Thalassiosira spp.",
+                         "Eucampia sp.", "A. glacialis")) %>% 
+        ggplot(mapping = aes(x=sp, y=ratio)) +
+        # add the lengths as points 
+        geom_point(position = ggplot2::position_jitterdodge(dodge.width = 0.60),
+                                 alpha = 0.4,
+                                 size = 3,
+                                 stroke = 0,
+                                 na.rm = TRUE,aes(color=sp)) +
+        # add the boxplot
+        geom_boxplot(outlier.shape = NA,width = 0.4, alpha = 0, na.rm = TRUE) +
+        # add the violin plot 
+        geom_violin(width = 0.6, alpha = 0, na.rm = TRUE) + 
+        # add the mean 
+        geom_point(mapping = aes(x=sp, y=M),
+          data = centrality_no0,
+          inherit.aes = FALSE,
+          size = 5, color = "darkred") + 
+         ggrepel::geom_label_repel(data = centrality_no0,
+          mapping = aes(x=sp, y=M, label = lab),
+          inherit.aes = FALSE,
+          size = 3,nudge_x = 0.4, segment.linetype = 4,min.segment.length = 0) + 
+        scale_color_viridis_d() + 
+         theme_bw() + 
+         theme(legend.position="none",
+               text=element_text(size=12),
+               axis.title.y = element_text(face="bold",size=11),
+                panel.border = element_blank(),
+                panel.grid.major.x = element_blank()) +
+         labs(x="",y="Daily ratio")
+pratio
+
+# for publication
+pdavg <- davg %>% 
+    filter(sp %in% c("A. sanguinea",
+                     "Guinardia sp.", "Chaetoceros spp. chain")) %>% 
+    ggplot(aes(x=hour,y=vol,color=sp)) + 
+    geom_line() + 
+    geom_point() + 
+    theme_classic() + 
+    scale_y_continuous(labels = label_comma()) + 
+    scale_color_manual(values=wes_palette("GrandBudapest1",3)) + 
+    labs(x="Hour",y="Mean biovolume") + 
+    theme_classic() + 
+    theme(text=element_text(size=12),
+          axis.title.y=element_text(face="bold"),
+          legend.position="none")
+
+ptavg <- tavg %>% 
+    filter(sp %in% c("Eucampia sp.", "A. glacialis",
+                     "L. minimus")) %>% 
+    ggplot(aes(x=time,y=vol,color=sp)) + 
+    geom_line() + 
+    geom_point() + 
+    geom_vline(xintercept=6.5, color="black",linetype="dashed") + 
+    geom_text(aes(x=8,y=2000,label="Low tide"),color="black") + 
+    theme_classic() + 
+    scale_y_continuous(labels = label_comma()) + 
+    scale_color_manual(values=wes_palette("GrandBudapest1",3)) + 
+    labs(x="Tidal hour",y="Mean biovolume") + 
+    theme_classic() + 
+    theme(text=element_text(size=12),
+    axis.title.y=element_text(face="bold"),
+    legend.position="none") 
+
+pcycles <- plot_grid(pdavg,ptavg,align="vh",labels=c("b","c"),ncol=2)
+plot_grid(pratio,pcycles,labels=c("a",""),nrow=2)
+```
+
+```{r}
+ggsave(path = "../figures/", filename="Fig7.tiff", width = 5, height = 3, device='tiff', dpi=300, units="in",scale=1.5)
+```
+
+# Resolution considerations
+
+This last piece of code makes a summary graph of resolutions considerations for the species based on the number of peaks detected and percentage of peaks less than 7 days long.
+
+```{r}
+library(ggrepel)
+all <- read_csv("../data/Hitormiss_all.csv")
+all %>% 
+    mutate(bavg = parse_number(`Avg bloom length`),
+           res = str_split_i(`Resolution minimum`,pattern=" ", i=1)) %>% 
+    ggplot(aes(x=`#peaks`,y=`% < 7days`*100,color=res)) + 
+    geom_vline(xintercept=c(10,22),linetype="dashed") + 
+    geom_point() +
+    geom_label_repel(aes(label=Sp)) +
+    theme_classic() + 
+    scale_colour_discrete(l = 40) + 
+    scale_y_continuous(limits=c(20,80)) + 
+    labs(x="# peaks above threshold",
+         y="% of peaks < 7 days",
+         color="Minimum \nresolution") + 
+    theme(text=element_text(size=12),
+          legend.title=element_text(face="bold"),
+          axis.title=element_text(face="bold"),
+          legend.position="none")
+```
+
+```{r}
+ggsave(path = "../figures/", filename="Fig8.tiff", width = 5, height = 3, device='tiff', dpi=300, units="in",scale=1.9)
+```

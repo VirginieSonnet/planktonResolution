@@ -1,0 +1,352 @@
+---
+title: "General community composition" # title of the notebook
+author: "Virginie Sonnet" 
+date: 2023-10-01
+description: 
+    This script analyzes the general community composition at different resolutions.  
+html: 
+theme: sandstone
+#mainfont: "LM Roman"
+fontsize: 0.99em
+toc: true # table of contents
+toc-depth: 5 
+toc-location: left # table of contents on the left 
+lightbox: TRUE # allows to click on an image to zoom in the HTML document
+embed-resources: true # avoid having dependencies in an extra folder
+smooth-scroll: true
+editor: visual
+code-overflow: wrap
+code-fold: true
+execute:
+    eval: true # run the code chunks FALSE/TRUE
+    echo: true # print the source code FALSE/TRUE
+    error: true # print error messages FALSE/TRUE
+    message: false # print any message FALSE/TRUE
+    warning: false # print warning message FALSE/TRUE
+    cache: false 
+---
+
+```{r}
+#| eval: false
+#| echo: false
+
+Other outputs: pdf_document, html_notebook, word_document 
+The HTML below just says to use the "LM Roman" family as font (kind of Arial?) and if you want the Latex font, you just need "Latin Modern Roman". The line below indicates that the text has to be justified. 
+```
+
+```{r}
+#| include: false
+
+# make sure that no object is in the environment and collect the garbage 
+rm(list=ls())
+gc()
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(vegan)
+library(ggstatsplot)
+library(ggrepel)
+library(cowplot)
+library(scales)
+```
+
+# Introduction
+
+------------------------------------------------------------------------
+
+This script means to look at differences in the community composition across the dataset at the group level, precise group level and species level for each of the 4 different resolutions.
+
+We can add a temporal separation with seasons: winter (December, January, February), spring (March, April, May), Summer (June, July, August) and fall (September, October, November).
+
+```{r}
+data <- read_csv("../data/processed_gsoIFCB_resampled_classes.csv") %>% 
+    mutate(date=with_tz(date,"America/New_York")) %>% 
+    mutate(day=floor_date(date,"day"),
+           season = case_when(month(date) %in% c(12,1,2) ~ "Winter",
+                           month(date) %in% 3:5 ~ "Spring",
+                           month(date) %in% 6:8 ~"Summer",
+                           month(date) %in% 9:11 ~"Fall")) %>% 
+    # reorder the factors
+    mutate(type=factor(type,levels=c("NBPTS","Satellite","Daily","Hourly")),
+           group_type=factor(group_type,levels=c("Diatoms","nanophytoplankton",
+                                                 "Dinoflagellates","Ciliates",
+                                                 "Others", "Silicoflagellates",
+                                                 "Zooplankton")),
+           season=factor(season,levels=c("Winter","Spring","Summer","Fall")))
+    
+```
+
+# Bar plots
+
+## Broad groups
+
+```{r}
+# calculate the proportion of community per group depending on the resolution
+gpdata <- data %>% 
+    # add the volumes of each group
+    group_by(type,group_type) %>% 
+    summarize(vol=sum(vol,na.rm=TRUE)) %>% 
+    # calculate the percentage represented
+    group_by(type) %>% 
+    mutate(tot=sum(vol)) %>% 
+    mutate(p=vol*100/tot) %>% 
+    mutate(plab=round(p),
+           lab=paste(plab,"%",sep="")) %>% 
+    mutate(lab=ifelse(p < 5,NA,lab))
+
+# by season
+gpdata_season <- data %>% 
+    # add the volumes of each group
+    group_by(type,group_type,season) %>% 
+    summarize(vol=sum(vol,na.rm=TRUE)) %>% 
+    # calculate the percentage represented
+    group_by(type,season) %>% 
+    mutate(tot=sum(vol)) %>% 
+    mutate(p=vol*100/tot) %>% 
+    mutate(plab=round(p),
+           lab=paste(plab,"%",sep="")) %>% 
+    mutate(lab=ifelse(p < 5,NA,lab))
+```
+
+```{r}
+# general
+pgroup <- gpdata %>% 
+    ggplot(aes(x=type,y=p,fill=group_type)) + 
+    geom_col() + 
+    geom_text(aes(label=lab),position = position_stack(vjust = 0.5),
+              color="white") + 
+    theme_classic() + 
+    scale_fill_manual(values=c("#00441b","#ff2500","#f2ad00","#5abcd6",
+                               "darkorchid4","#f98400","#5b1a18")) + 
+    labs(x="",y="",fill="Broad groups") + 
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1,scale=1)) + 
+    theme(legend.title = element_text(face="bold"),
+          text=element_text(size=12),
+          legend.text=element_text(size=10))
+pgroup
+
+# per season
+pgroup_season <- gpdata_season %>% 
+    ggplot(aes(x=type,y=p,fill=group_type)) + 
+    geom_col() + 
+    geom_text(aes(label=lab),position = position_stack(vjust = 0.5),
+              color="white") + 
+    facet_wrap(.~season,ncol=4,scales="fixed") + 
+    theme_classic() + 
+    scale_fill_manual(values=c("#00441b","#ff2500","#f2ad00","#5abcd6",
+                               "darkorchid4","#f98400","#5b1a18")) + 
+    labs(x="",y="",fill="Broad groups") + 
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1,scale=1)) + 
+    theme(legend.title = element_text(face="bold"),
+          text=element_text(size=12),
+          legend.position="bottom")
+pgroup_season
+```
+
+## Subgroups
+
+```{r}
+sgpdata <- data %>% 
+    group_by(type,group_type,group_type_precise) %>% 
+    summarize(vol=sum(vol,na.rm=TRUE)) %>% 
+    group_by(type) %>% 
+    mutate(tot=sum(vol)) %>% 
+    mutate(p=vol*100/tot) %>% 
+    mutate(plab=round(p),
+           lab=paste(plab,"%",sep="")) %>% 
+    mutate(lab=ifelse(p < 5,NA,lab)) %>% 
+    arrange(group_type,vol)
+
+# by season
+sgpdata_season <- data %>% 
+    group_by(type,group_type,group_type_precise,season) %>% 
+    summarize(vol=sum(vol,na.rm=TRUE)) %>% 
+    group_by(type,season) %>% 
+    mutate(tot=sum(vol)) %>% 
+    mutate(p=vol*100/tot) %>% 
+    mutate(plab=round(p),
+           lab=paste(plab,"%",sep="")) %>% 
+    mutate(lab=ifelse(p < 5,NA,lab)) %>% 
+    arrange(group_type,vol)
+```
+
+```{r}
+# define colors for classes
+classes <- distinct(ungroup(sgpdata), group_type_precise)
+classes$color <- rev(c("#5b1a18","#8c510a","#bf812e", # zooplankton
+                   "#f98400", # silicoflagellates
+                   "darkorchid4", # others
+                   "#5abcd6","#7fcdbb","#92c5de","#c6dbef", # ciliates
+                   "#f2ad00","#fec44f","#fed976","#ffeda0","#fffecc", 
+                   "#fffee5", # dinoflagellates
+                   "#ff2500","tomato2", # protozoa
+                   "#00441b","#006d2c","#248b45","#41ab5d","#74c476",
+                   "#a1d99b","#c7e9c0","#e5f5e0","#f7fcf5")) # diatoms
+cols <- classes %>% ungroup() %>% distinct(group_type_precise, color) %>% deframe()
+
+# general
+psgroup <- sgpdata %>% 
+    ungroup() %>% 
+    mutate(group_type_precise=factor(group_type_precise,
+                                     levels=unique(group_type_precise))) %>% 
+    ggplot(aes(x=type,y=p,fill=group_type_precise)) + 
+    geom_col() + 
+    geom_text(aes(label=lab),position = position_stack(vjust = 0.5),
+              color="white") + 
+    scale_fill_manual(values=cols) + 
+    theme_classic() + 
+    labs(x="",y="",fill="Sub-groups") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1,scale=1)) +
+        theme(legend.title = element_text(face="bold"),
+          legend.text=element_text(size=10),
+          text=element_text(size=12))
+psgroup 
+
+
+# by season 
+psgroup_season <- sgpdata_season %>% 
+    ungroup() %>% 
+    mutate(group_type_precise=factor(group_type_precise,
+                                     levels=unique(sgpdata$group_type_precise))) %>% 
+    ggplot(aes(x=type,y=p,fill=group_type_precise)) + 
+    geom_col() + 
+    geom_text(aes(label=lab),position = position_stack(vjust = 0.5),
+              color="white") + 
+    facet_wrap(.~season,ncol=4,scales="fixed") + 
+    scale_fill_manual(values=cols) + 
+    theme_classic() + 
+    labs(x="",y="",fill="Sub-groups") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1,scale=1)) +
+        theme(legend.title = element_text(face="bold"),
+          legend.text=element_text(size=10),
+          text=element_text(size=12))
+psgroup_season 
+```
+
+## Categories
+
+Consider that any species that make up less than 2% is in the category "others".
+
+```{r}
+# don't group < 2% as others for statistics
+spdata_all <- data %>% 
+    # calculate the percentage of speces per type
+    group_by(type,group_type,group_type_precise,sp) %>% 
+    summarize(vol=sum(vol,na.rm=TRUE)) %>% 
+    group_by(type) %>% 
+    mutate(tot=sum(vol)) %>% 
+    mutate(p=vol*100/tot)
+
+
+spdata <- spdata_all %>% 
+    # consider categories < 2% as others and sum them
+    mutate(name=ifelse(p < 2,"others",sp)) %>% 
+    group_by(type,name) %>% 
+    summarize(p=sum(p)) %>% 
+    mutate(plab=round(p)) %>% 
+    mutate(lab=paste(plab,"%",sep="")) %>%
+    mutate(lab=ifelse(p < 5,NA,lab)) %>% 
+    # re-add the group_types
+    rename(sp=name) %>% 
+    left_join(distinct(data,group_type,group_type_precise,sp)) %>% 
+    arrange(group_type,group_type_precise,p)
+
+
+# by season
+# don't group < 3.5% as others for statistics
+spdata_season_all <- data %>% 
+    # calculate the percentage of species per type
+    group_by(type,group_type,group_type_precise,sp,season) %>% 
+    summarize(vol=sum(vol,na.rm=TRUE)) %>% 
+    group_by(type,season) %>% 
+    mutate(tot=sum(vol)) %>% 
+    mutate(p=vol*100/tot) 
+
+spdata_season <- spdata_season_all %>% 
+    # consider categories < 3.5% as others and sum them
+    mutate(name=ifelse(p < 3.5,"others",sp)) %>% 
+    group_by(type,season,name) %>% 
+    summarize(p=sum(p)) %>% 
+    mutate(plab=round(p)) %>% 
+    mutate(lab=paste(plab,"%",sep="")) %>%
+    mutate(lab=ifelse(p < 10,NA,lab)) %>% 
+    # re-add the group_types
+    rename(sp=name) %>% 
+    left_join(distinct(data,group_type,group_type_precise,sp)) %>% 
+    arrange(group_type,group_type_precise,p)
+```
+
+```{r}
+# add colors 
+classes <- distinct(ungroup(spdata), group_type,sp)
+classes$color <- c("#f7fcf5","#e5f5e0","#c7e9c0","#a1d99b", 
+                   "#74c476","#41ab5d","palegreen4","seagreen4","#248b45","#006d2c", "#00441b", # diatoms
+                   "#ff2500", # protozoa
+                   "#f2ad00","#ffeda0", # dinoflagellates
+                   "#5abcd6", # ciliates
+                   "grey" ) # others
+                       
+cols <- classes %>% ungroup() %>% distinct(sp, color) %>% deframe()
+
+
+sp <- spdata %>% 
+    ungroup() %>% 
+    mutate(sp=factor(sp,levels=unique(sp))) %>% 
+    ggplot(aes(x=type,y=p,fill=sp)) + 
+    geom_col() + 
+    geom_text(aes(label=lab),position = position_stack(vjust = 0.5),
+              color="white") + 
+    scale_fill_manual(values=cols) + 
+    theme_classic() + 
+    labs(x="",y="",fill="Categories") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1,scale=1)) + 
+    theme(legend.title = element_text(face="bold"),
+          legend.text=element_text(size=10),
+          text=element_text(size=12))
+sp 
+
+
+
+# add colors 
+classes <- distinct(ungroup(spdata_season), group_type,sp)
+classes$color <- c("#f7fcf5","#e5f5e0","#c7e9c0","#a1d99b", "palegreen3",
+                   "#74c476","#41ab5d","palegreen4",
+                   "seagreen4","#248b45","#006d2c", "#00441b", # diatoms
+                   "#ff2500", # protozoa
+                   "#f2ad00","#fec44f","#fed976","#ffeda0", # dinoflagellates
+                   "#5abcd6", # ciliates
+                   "grey" ) # others
+                       
+cols <- classes %>% ungroup() %>% distinct(sp, color) %>% deframe()
+
+# by season
+sp_season <- spdata_season %>% 
+    ungroup() %>% 
+    mutate(sp=factor(sp,levels=unique(spdata_season$sp))) %>% 
+    ggplot(aes(x=type,y=p,fill=sp)) + 
+    geom_col() + 
+    geom_text(aes(label=lab),position = position_stack(vjust = 0.5),
+              color="white") + 
+    facet_wrap(.~season,ncol=4,scales="fixed") + 
+    scale_fill_manual(values=cols) + 
+    theme_classic() + 
+    labs(x="",y="",fill="Categories") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1,scale=1)) + 
+    theme(legend.title = element_text(face="bold"),
+          legend.text=element_text(size=10,face="italic"),
+          text=element_text(size=12))
+sp_season 
+```
+
+## Combine
+
+```{r}
+p1 <- plot_grid(pgroup,psgroup,labels="auto",rel_widths=c(1,1.4),ncol=2)
+plot_grid(p1,sp_season,nrow=2, labels = c('', 'c'))
+```
+
+```{r}
+ggsave(path = "../figures/", filename="Fig3.tiff", width = 5.75, height = 4.75, device='tiff', dpi=300, units="in",scale=2)
+```

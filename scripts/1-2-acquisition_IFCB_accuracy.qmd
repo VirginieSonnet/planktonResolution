@@ -1,0 +1,342 @@
+---
+title: "Categories accuracy" # title of the notebook
+author: "Virginie Sonnet" 
+date: 2023-10-01
+description: 
+    This script computes different accuracy metrics for the IFCB classes.
+html: 
+theme: sandstone
+#mainfont: "LM Roman"
+fontsize: 0.99em
+toc: true # table of contents
+toc-depth: 5 
+toc-location: left # table of contents on the left 
+lightbox: TRUE # allows to click on an image to zoom in the HTML document
+embed-resources: true # avoid having dependencies in an extra folder
+smooth-scroll: true
+editor: visual
+code-overflow: wrap
+code-fold: false
+number-sections: true
+execute:
+    eval: true # run the code chunks FALSE/TRUE
+    echo: true # print the source code FALSE/TRUE
+    error: true # print error messages FALSE/TRUE
+    message: false # print any message FALSE/TRUE
+    warning: false # print warning message FALSE/TRUE
+    cache: false 
+---
+
+```{r}
+#| eval: false
+#| echo: false
+
+Other outputs: pdf_document, html_notebook, word_document 
+The HTML below just says to use the "LM Roman" family as font (kind of Arial?) and if you want the Latex font, you just need "Latin Modern Roman". The line below indicates that the text has to be justified. 
+```
+
+```{r}
+#| include: false
+
+# make sure that no object is in the environment and collect the garbage 
+rm(list=ls())
+gc()
+```
+
+```{r}
+# data manipulation
+library(tidyverse)
+
+# plotting
+library(wesanderson)
+
+# indices 
+library(caret)
+```
+
+# Introduction
+
+------------------------------------------------------------------------
+
+The general accuracy can be misleading. The F1-score, recall and precision can help and these metrics can be calculated including or not the images automatically labelled unclassified.
+
+-   recall/sensitivity: proportion of the successful identifications, \[True positives/(True positives + False negatives)\]
+
+-   precision: proportion of the positive identifications were correct \[True Positives/(True Positives + False Positives)\]
+
+-   F1 score: summarizes both the sensitivity and precision and expresses the balance between the two \[2 ∗ ((precision ∗ sensitivity)/(precision + sensitivity))\]
+
+For each new classifier (trained classification algorithm) we create a document showing the manual and automatic classifications for manually identified images. This document can be used to compute accuracy metrics.
+
+```{r}
+data <- read_csv("../data/processed_gsoIFCB_classifier14.csv")
+```
+
+# General accuracy
+
+------------------------------------------------------------------------
+
+Let's see the general accuracy at different taxonomic levels with and without unclassified images. I first removed the images that are in the unused class because those are wrong by default (those classes weren't used in the classifier).
+
+```{r}
+# calculate the general accuracy with 
+manual <- data %>% 
+    filter(set != "unused_class") %>% 
+    # focus on the classification status 
+    select(c(starts_with("status"))) %>% 
+    # add the total number of manually classified images
+    add_count(.,name="tot_classifier") %>%
+    # get the number of correct and wrong images in each level
+    pivot_longer(starts_with("status"),names_to="level",values_to="status") %>% 
+    count(tot_classifier,level,status) %>%
+    # calculate percentage
+    mutate(perc=n/tot_classifier*100) %>% 
+    # only keep the correct ones
+    filter(status != "Wrong") %>%
+    # for plotting, remove the "status" in front of the levels
+    mutate(level=str_to_sentence(str_split_i(level,"_",i=2)))
+
+# same but without unclassified images! 
+no_unclassified <- data %>% 
+    filter(auto_class != "unclassified" & set != "unused_class") %>% 
+    # focus on the classification status 
+    select(c(starts_with("status"))) %>% 
+    # add the total number of manually classified images
+    add_count(.,name="tot_classifier") %>%
+    # get the number of correct and wrong images in each level
+    pivot_longer(starts_with("status"),names_to="level",values_to="status") %>% 
+    count(tot_classifier,level,status) %>%
+    # calculate percentage
+    mutate(perc=n/tot_classifier*100) %>% 
+    # only keep the correct ones
+    filter(status != "Wrong") %>%
+    # for plotting, remove the "status" in front of the levels
+    mutate(level=paste(str_to_sentence(str_split_i(level,"_",i=2)),"w/o unclassified"))
+
+accuracy <- bind_rows(manual,no_unclassified) %>% 
+    mutate(level=factor(level,levels=unique(level)))
+
+
+ggplot(accuracy,aes(x=level,y=perc,color=level)) + 
+    geom_point(size=2) + 
+    geom_text(aes(label=round(perc,2)), nudge_x=0.25) + 
+    geom_hline(aes(yintercept = 80), lty = 2) +
+    coord_flip() +
+    scale_color_manual(values=wes_palette("Darjeeling1",n=6,type="continuous"),
+                       guide = guide_legend(reverse = TRUE)) + 
+    labs(x = NULL,y="Percentage of accuracy",color="") + 
+    theme_bw() + 
+    theme(panel.grid.minor=element_blank(),
+          text=element_text(family="Lato",size=12),
+          legend.position="none") + 
+    ggtitle("Accuracy for all images")
+
+```
+
+We can also only include the validation set:
+
+```{r}
+# calculate the general accuracy with 
+manual <- data %>% 
+    filter(set=="validation") %>% 
+    # focus on the classification status 
+    select(c(starts_with("status"))) %>% 
+    # add the total number of manually classified images
+    add_count(.,name="tot_classifier") %>%
+    # get the number of correct and wrong images in each level
+    pivot_longer(starts_with("status"),names_to="level",values_to="status") %>% 
+    count(tot_classifier,level,status) %>%
+    # calculate percentage
+    mutate(perc=n/tot_classifier*100) %>% 
+    # only keep the correct ones
+    filter(status != "Wrong") %>%
+    # for plotting, remove the "status" in front of the levels
+    mutate(level=str_to_sentence(str_split_i(level,"_",i=2)))
+
+# same but without unclassified images! 
+no_unclassified <- data %>% 
+    filter(auto_class != "unclassified" & set=="validation") %>% 
+    # focus on the classification status 
+    select(c(starts_with("status"))) %>% 
+    # add the total number of manually classified images
+    add_count(.,name="tot_classifier") %>%
+    # get the number of correct and wrong images in each level
+    pivot_longer(starts_with("status"),names_to="level",values_to="status") %>% 
+    count(tot_classifier,level,status) %>%
+    # calculate percentage
+    mutate(perc=n/tot_classifier*100) %>% 
+    # only keep the correct ones
+    filter(status != "Wrong") %>%
+    # for plotting, remove the "status" in front of the levels
+    mutate(level=paste(str_to_sentence(str_split_i(level,"_",i=2)),"w/o unclassified"))
+
+accuracy <- bind_rows(manual,no_unclassified) %>% 
+    mutate(level=factor(level,levels=unique(level)))
+
+
+ggplot(accuracy,aes(x=level,y=perc,color=level)) + 
+    geom_point(size=2) + 
+    geom_text(aes(label=round(perc,2)), nudge_x=0.25) + 
+    geom_hline(aes(yintercept = 80), lty = 2) +
+    coord_flip() +
+    scale_color_manual(values=wes_palette("Darjeeling1",n=6,type="continuous"),
+                       guide = guide_legend(reverse = TRUE)) + 
+    labs(x = NULL,y="Percentage of accuracy",color="") + 
+    theme_bw() + 
+    theme(panel.grid.minor=element_blank(),
+          text=element_text(family="Lato",size=12),
+          legend.position="none") + 
+    ggtitle("Accuracy for validation images")
+```
+
+# Classes
+
+## Heatmap
+
+```{r}
+hm <- data %>% 
+    filter(auto_class != "unclassified" & set=="validation") %>% 
+    select(manual_class,auto_class) %>% 
+    # add the total number of manually classified images
+    add_count(manual_class,name="tot_class") %>%
+    # get the number of correct and wrong images in each level
+    count(manual_class,auto_class,tot_class) %>% 
+    # calculate percentage
+    mutate(perc=n/tot_class*100) %>% 
+    select(manual_class,auto_class,perc)
+
+hm %>% 
+    filter(perc != 100) %>% 
+    mutate(perc=ifelse(manual_class==auto_class,NA,perc)) %>%
+    ggplot(aes(x=manual_class,y=auto_class,z=perc,fill=perc)) + 
+    geom_tile() + 
+    scale_fill_viridis_c() + 
+    theme(text=element_text(size=10),
+          axis.text.x = element_text(angle = 45,hjust=1))
+```
+
+## Accuracy
+
+Let's calculate the general accuracy, F1-score, recall and precision for each class, only using the validation set.
+
+Let's focus on each class, not considering the unclassified images.
+
+```{r}
+# accuracy
+measures <- data %>% 
+    filter(auto_class != "unclassified" & set=="validation") %>% 
+    # focus on the classification status 
+    select(manual_class,status_class) %>% 
+    # add the total number of manually classified images
+    add_count(manual_class,name="tot_class") %>%
+    # get the number of correct and wrong images in each level
+    count(manual_class,tot_class,status_class) %>%
+    # calculate percentage
+    mutate(perc=n/tot_class*100) %>% 
+    # only keep the correct ones
+    filter(status_class != "Wrong")
+```
+
+F1 score, recall and precision. We can calculate them for all images or only for validation images.
+
+```{r}
+### all images
+subset <- data %>% filter(auto_class != "unclassified" &  set != "unused_class")
+    
+# create the confusion matrix and measures
+confM=confusionMatrix(reference = factor(subset$manual_class), data = factor(subset$auto_class), mode='everything')
+
+# general accuracy 
+accuracy <- tibble(accuracy=confM[["overall"]][["Accuracy"]],
+                   accuracy_low=confM[["overall"]][["AccuracyLower"]],
+                   accuracy_up=confM[["overall"]][["AccuracyUpper"]])
+accuracy
+
+# species accuracy 
+indices <- as_tibble(confM[["byClass"]],rownames="manual_class",type="all") %>% 
+    mutate(manual_class=str_split_i(manual_class,": ",2)) %>% 
+    select(c(manual_class,Precision:F1)) %>% 
+    rename(all_Precision=Precision,all_Recall=Recall,all_F1=F1)
+
+
+### only validation images
+subset <- data %>% filter(auto_class != "unclassified" &  set == "validation") %>% 
+    # remove the classes that didn't have enough images for validation
+    filter(auto_class %in% manual_class)
+    
+# create the confusion matrix and measures
+confM=confusionMatrix(reference = factor(subset$manual_class), data = factor(subset$auto_class), mode='everything')
+
+# general accuracy 
+vaccuracy <- tibble(accuracy=confM[["overall"]][["Accuracy"]],
+                   accuracy_low=confM[["overall"]][["AccuracyLower"]],
+                   accuracy_up=confM[["overall"]][["AccuracyUpper"]])
+vaccuracy
+
+# species accuracy 
+vindices <- as_tibble(confM[["byClass"]],rownames="manual_class",type="all") %>% 
+    mutate(manual_class=str_split_i(manual_class,": ",2)) %>% 
+    select(c(manual_class,Precision:F1))
+```
+
+We can have them together to export and plot:
+
+```{r}
+measures <- left_join(measures,indices) %>% 
+    left_join(vindices) %>% 
+    arrange(desc(F1))
+```
+
+I can show it only for the species we are selecting:
+
+```{r}
+measures %>% 
+    filter(manual_class %in% c("Asterionella glacialis",
+                              "Leptocylindrus minimus",
+                              "Akashiwo sanguinea",
+                              "Mesodinium",
+                              "group cerataulina_pelagica",
+                              "licmophora single",
+                              "group dinophysiales",
+                              "Dinobryon",
+                              "group chaetoceros_chain",
+                              "Odontella aurita",
+                              "Margalefidinium polykrikoides",
+                              "group silicoflagellates",
+                              "group chaetoceros_single",
+                              "Odontella mobiliensis",
+                              "group protozoa_morphology",
+                              "group pleuro_gyrosigma",
+                              "group cylindrotheca",
+                              "group pseudo-nitzschia",
+                              "group ceratiaceae",
+                              "Dactyliosolen blavyanus",
+                              "group rhizosolenia",
+                              "group eucampia",
+                              "skeletonema small",
+                              "Skeletonema costatum",
+                              "Guinardia flaccida",
+                              "Guinardia delicatula",
+                              "Striatella unipunctata",
+                              "Thalassionema nitzschioides",
+                              "group thalassiosira_chain",
+                              "group thalassiosira_single")) %>% 
+    mutate(accuracy=perc/100) %>% 
+    select(manual_class,accuracy,Precision:F1) %>% 
+    pivot_longer(accuracy:F1,names_to="indices",values_to="values") %>% 
+    mutate(indices=factor(indices,levels=c("F1","Precision","Recall","accuracy"))) %>% 
+    arrange(indices,desc(values)) %>% 
+    mutate(manual_class=factor(manual_class,unique(manual_class))) %>% 
+    ggplot(aes(x=manual_class,y=values,color=manual_class)) + 
+        geom_point(size=2) + 
+        geom_hline(aes(yintercept = 0.8), lty = 2) + 
+        facet_wrap(.~indices,ncol=4) + 
+        coord_flip() +
+        scale_color_viridis_d() + 
+        labs(x = NULL,y="",color="",
+                 title=paste("Accuracy for classes")) + 
+        theme_bw() + 
+        theme(panel.grid.minor=element_blank(),
+              text=element_text(size=8),
+              legend.position="none") 
+```
